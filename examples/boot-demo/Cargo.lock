@@ -21,17 +21,7 @@ checksum = "39c67adce8d1f71bc306224f984071dd3307c31a2455338937d2f4006bcb240d"
 dependencies = [
  "aes",
  "atsamd-hal-macros",
- "atsamd51g",
  "atsamd51j",
- "atsamd51n",
- "atsamd51p",
- "atsame51g",
- "atsame51j",
- "atsame51n",
- "atsame53j",
- "atsame53n",
- "atsame54n",
- "atsame54p",
  "bitfield",
  "bitflags",
  "cipher",
@@ -69,120 +59,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "atsamd51g"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "167625584d95a2ec51a4bd57474168d2f695bff775b0b0b942cd5dbc7f361bd6"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
 name = "atsamd51j"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ab7e107d868d11815375ae1bc3d3370be42c1c7ac984d13bb1ab3037836343"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsamd51n"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3342397fbd189b931a56dd06333ada4dfb532a775a1afa8dd8a9046afd87aa3"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsamd51p"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12556e5e96dc6527acc472b8432cee241274a2278732b1068984df7a678984d3"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame51g"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e3ab0950b71e75725315a989ef4c775c9923c3d849f4effe0c71aaccc8ce6c0"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame51j"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d496aeaf9906845b3145e8b4d2d6c90be5259a8ff5b1d1b4a73a032fd6f887a1"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame51n"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29cd61ea3b04f7abb76ddd28c67abab6f30fea68ec0d37c023205438f564a0f5"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame53j"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98225b43f316eab519cf791e3d1b83e8851959aab3ba8a9ebd9133f104fd915b"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame53n"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d7872821aca1c9d87afc2e3bac5d3a239f6f34c47c657d78a5da556d7a7c517"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame54n"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3613a4b328f102127e66a3d69c189ad07671cde3bc9b7743873e36cb477d0064"
-dependencies = [
- "cortex-m",
- "critical-section",
- "vcell",
-]
-
-[[package]]
-name = "atsame54p"
-version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9b21b1ebf5492f3c60e89f1c766fdfdf3d776c252d4832755acd646551de8bf"
 dependencies = [
  "cortex-m",
  "critical-section",
@@ -217,6 +97,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "boot-demo"
+version = "0.0.0"
+dependencies = [
+ "atsamd-hal",
+ "cortex-m",
+ "cortex-m-rt",
+ "rtt-target",
+ "samd5-boot",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,7 +124,7 @@ checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -244,9 +135,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cfg-if"
-version = "1.0.4"
+version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "cipher"
@@ -278,6 +169,26 @@ name = "cortex-m-macros"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d1922be58519ad40368fc4ca595a2cefa51a7abf947be3b0c90586dc7dbd0e2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "cortex-m-rt"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c439b23bf18154d8a634543caf1ee73cceb723f2902f7ea243634159a00fd47"
+dependencies = [
+ "cortex-m-rt-macros",
+]
+
+[[package]]
+name = "cortex-m-rt-macros"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "061a75f3e7f3f01d649668d68e02d0ef92c7041a9c97b8fe6bc354ddbf40822d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -572,6 +483,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 
 [[package]]
+name = "rtt-target"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10b34c9e6832388e45f3c01f1bb60a016384a0a4ad80cdd7d34913bed25037f0"
+dependencies = [
+ "critical-section",
+ "ufmt-write",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -644,7 +565,7 @@ checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.5",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -711,9 +632,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.5"
+version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -727,10 +648,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
-name = "unicode-ident"
-version = "1.0.24"
+name = "ufmt-write"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+checksum = "e87a2ed6b42ec5e28cc3b94c09982969e9227600b2e3dcbc1db927a84c06bd69"
+
+[[package]]
+name = "unicode-ident"
+version = "1.0.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "unsafe-libyaml"

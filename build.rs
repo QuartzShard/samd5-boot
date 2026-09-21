@@ -127,16 +127,39 @@ fn main() {
             )
         });
 
+    // Carve the top page (consts::PAGE_SIZE) of the BOOT region into its own
+    // region for the boot-info block: cortex-m-rt's FLASH then stops below it,
+    // so BOOT code can never grow over the block, and the block sits in a
+    // region whose cursor is independent of FLASH (a single FLASH region with
+    // a top-pinned section trips lld's monotonic region cursor). Its origin is
+    // consts::BOOT_INFO_ADDR, where the application reads it.
+    let info_reserve = 512;
+    let boot_code_len = boot_len - info_reserve;
+    let boot_info_addr = boot_code_len;
+
     let boot_x = format!(
         "/* samd5-boot BOOT image: active-slot base (each bank's head),\n\
-         \x20  BOOTPROT-sized.\n\
+         \x20  BOOTPROT-sized. The top page (BOOTINFO) holds the boot-info\n\
+         \x20  block the application reads; FLASH is the BOOT code below it.\n\
          \x20  The BOOT binary's memory.x selects this role with the single\n\
          \x20  line `INCLUDE samd5_boot_boot.x`. */\n\
          MEMORY\n\
          {{\n\
-         \x20 FLASH : ORIGIN = 0x00000000, LENGTH = {boot_len}\n\
-         \x20 RAM   : ORIGIN = 0x20000000, LENGTH = {ram_size}\n\
-         }}\n"
+         \x20 FLASH    : ORIGIN = 0x00000000, LENGTH = {boot_code_len}\n\
+         \x20 BOOTINFO : ORIGIN = {boot_info_addr:#x}, LENGTH = {info_reserve}\n\
+         \x20 RAM      : ORIGIN = 0x20000000, LENGTH = {ram_size}\n\
+         }}\n\
+         \n\
+         /* Frozen flash ABI (consts::BOOT_INFO_ADDR): the application reads\n\
+         \x20  the boot-info block at a fixed absolute address, the top page\n\
+         \x20  of the BOOT region. */\n\
+         SECTIONS\n\
+         {{\n\
+         \x20 .samd5_boot_info ORIGIN(BOOTINFO) :\n\
+         \x20 {{\n\
+         \x20   KEEP(*(.samd5_boot_info));\n\
+         \x20 }} > BOOTINFO\n\
+         }} INSERT AFTER .vector_table;\n"
     );
 
     let app_x = format!(
@@ -167,13 +190,4 @@ fn main() {
     fs::write(out.join("samd5_boot_boot.x"), boot_x).unwrap();
     fs::write(out.join("samd5_boot_app.x"), app_x).unwrap();
     println!("cargo::rustc-link-search={}", out.display());
-
-    // Examples are in-tree BOOT skeletons: give them (and only them) the
-    // stock cortex-m-rt link flow, with examples/memory.x found first.
-    // Deliberately the legacy `cargo:` syntax: `cargo::` hard-errors on
-    // example link-args coming from a dependency's build script, and no
-    // primary-package signal reaches build-script processes to gate on.
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo:rustc-link-arg-examples=-L{manifest_dir}/examples");
-    println!("cargo:rustc-link-arg-examples=-Tlink.x");
 }

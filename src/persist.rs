@@ -13,6 +13,9 @@ use atsamd_hal::{nvm::PhysicalBank, pac::Nvmctrl};
 
 use crate::consts::SEEPROM_ADDR;
 
+/// The full persisted boot record: three single-word sub-structs, each
+/// written independently and power-atomically (see [`BootStorage`]). Read at
+/// boot and rewritten as state advances.
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy, Default)]
 #[repr(C)]
 pub struct BootStore {
@@ -39,6 +42,9 @@ pub unsafe trait BootStorage {
 
     /// On ReadErr, you probably want to either retry or `unwrap_or_default()` (zeroed)
     fn read(&mut self) -> Result<BootStore, Self::ReadErr>;
+    /// Persist the record. Must honour the per-word power-atomicity in the
+    /// trait's `# Safety` contract: only whole words may change, never a torn
+    /// one.
     fn write(&mut self, val: BootStore) -> Result<(), Self::WriteErr>;
 }
 
@@ -67,10 +73,13 @@ impl BootState {
         }
     }
 
+    /// The stored [`BankState`] of a physical bank.
     pub fn bank(self, bank: &PhysicalBank) -> BankState {
         BankState::from_bits(self.states >> Self::shift(bank))
     }
 
+    /// Overwrite one physical bank's [`BankState`], leaving the other bank's
+    /// bits and the reserved upper bits untouched.
     pub fn set_bank(&mut self, bank: &PhysicalBank, state: BankState) {
         let shift = Self::shift(bank);
         self.states = (self.states & !(0b11 << shift)) | ((state as u8) << shift);
@@ -90,7 +99,11 @@ impl BootState {
     }
 }
 
-/// Never stored directly: packed 2 bits per bank in [`BootState`].
+/// State of one bank's image, packed 2 bits per bank in [`BootState`] (never
+/// stored directly). `None` is the all-zeros default, no image or a fresh chip,
+/// bootable in steady state; `New` is an installed image on trial, counted
+/// against the attempt budget until confirmed; `Valid` is a confirmed image;
+/// `Invalid` is condemned and never re-trialed.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum BankState {
     #[default]
@@ -208,11 +221,14 @@ const STORE_WORDS: usize = size_of::<BootStore>() / 4;
 /// read-back in [`SmartEepromStore`]'s `write` surfaces it as this.
 pub struct SeeWriteFailed;
 
+/// Why [`SmartEepromStore::new`] rejected the live SmartEEPROM configuration.
+/// `SeeUnavailable`: SBLK 0 (disabled) or a reserved SBLK (11+). `SeeBuffered`:
+/// `SEECFG.WMODE` buffered, which defers word commits and voids per-word
+/// power-atomicity. `OffsetOutOfRange`: `OFFSET + size_of::<BootStore>()` past
+/// the configured virtual size.
 pub enum StoreConfigError {
     SeeUnavailable,
     SeeLocked,
-    /// word commits would be deferred,
-    /// voiding the power-atomicity contract
     SeeBuffered,
     OffsetOutOfRange,
 }

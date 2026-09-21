@@ -11,11 +11,8 @@ cortex-m = "0.7.9"
 # which the HAL does not publicly re-export
 embedded-hal-02 = { package = "embedded-hal", version = "0.2.7" }
 
-# Examples only (the crate itself stays -rt-agnostic, and leaves the
-# critical-section impl to the final binary).
-[dev-dependencies]
-cortex-m-rt = "0.7"
-cortex-m = { version = "0.7.9", features = ["critical-section-single-core"] }
+# The BOOT skeleton is a standalone downstream crate under examples/, so it
+# carries -rt and the critical-section impl itself; this crate has neither.
 
 [features]
 # Chip selection: enable exactly one part feature.

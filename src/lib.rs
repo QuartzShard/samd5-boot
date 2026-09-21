@@ -1,11 +1,104 @@
-//! samd5-boot
+//! An A/B firmware-update bootloader for Microchip SAM D5x/E5x
+//! (`ATSAMD5x`/`ATSAME5x`) MCUs, built on the silicon's native dual-bank
+//! swap (`BKSWRST`) rather than a software copy engine.
 //!
-//! This crate leverages the dual-bank layout of ATSAMD/E5x chips, and the BKSWRST instruction which
-//! re-maps them and reboots to implement a safe-update, trial and rollback capable bootloader for
-//! these chips.
+//! The governing guarantee is that no single failure bricks the device: a
+//! power cut at any byte, an accepted-but-broken image, or a wedged trial
+//! boot always leaves a bootable image mapped. An identical BOOT binary is
+//! bench-installed at the head of both banks and is never rewritten by a
+//! field update, so the revert path is present in whichever bank the chip
+//! resets into.
 //!
-//! # Memory Layout
+//! # Banks and slots
 //!
+//! The vocabulary is load-bearing:
+//!
+//! - A *bank* is a physical flash half (A or B, the `STATUS.AFIRST`
+//!   domain). Persisted per-bank state ([`persist::BootState`]) is keyed by
+//!   physical bank and resolved through `Nvm::first_bank`, so the record
+//!   survives a swap while the mapping flips.
+//! - A *slot* is a mapped position. The active slot is always at the base
+//!   of flash ([`ACTIVE_SLOT_ADDR`](consts::ACTIVE_SLOT_ADDR)); the inactive
+//!   slot is in the upper half ([`INACTIVE_SLOT_ADDR`]).
+//!
+//! `BKSWRST` (one NVMCTRL command) flips which bank occupies which slot,
+//! reallocates any live SmartEEPROM reserve into the other bank, and resets.
+//! The fuse program is a single commit point: a power loss yields the old
+//! mapping or the new one, never a half-swap. Nothing but software ever
+//! flips the mapping back, so a revert is itself a swap.
+//!
+//! # Memory layout
+//!
+//! Within a slot (shown here for the active slot at `0x0`), the BOOT region
+//! sits at the base under BOOTPROT and the application image begins just
+//! above it. Two structures sit at frozen offsets so the BOOT and app
+//! binaries agree on where to find them across independent builds:
+//!
+//! ```text
+//! 0x0000_0000                    ┌──────────────────────────┐ ─┐
+//!                                │ BOOT vector table + code │  │ BOOT region
+//! BOOT_INFO_ADDR (top page)      │ boot-info block          │  │ (BOOTPROT)
+//! BOOT_SIZE                      ├──────────────────────────┤ ─┤
+//!                                │ app vector table         │  │
+//! + MANIFEST_OFFSET (0x400)      │ app manifest             │  │ app image
+//!                                │ app code                 │  │
+//! bank top − SmartEEPROM reserve └──────────────────────────┘ ─┘
+//! ```
+//!
+//! The boot-info block ([`boot_info`]) is embedded by BOOT and read by the
+//! application to audit compatibility; the manifest ([`manifest`]) is
+//! embedded by the application and read by BOOT to verify an image. Both are
+//! append-only flash ABIs.
+//!
+//! # The two binaries
+//!
+//! A deployment is one library and two thin downstream binaries. Each owns
+//! its own `memory.x`, which selects a role with a single line:
+//! `INCLUDE samd5_boot_boot.x` for the BOOT binary or
+//! `INCLUDE samd5_boot_app.x` for the application. `build.rs` generates
+//! those fragments (MEMORY, the manifest/boot-info section placement, and
+//! `_stext`) into `OUT_DIR` and exposes them via `rustc-link-search`, so
+//! they compose with the stock `cortex-m-rt` `-Tlink.x` flow while `memory.x`
+//! stays the downstream project's file. Both binaries must build with the
+//! same part and `bootprot-*` features, since the geometry is frozen per
+//! device once BOOT is installed.
+//!
+//! ## BOOT flow
+//!
+//! The BOOT binary constructs a [`Boot`] from the NVM, DSU, and watchdog
+//! peripherals with [`Boot::new`] (or [`Boot::init`] to provision the
+//! BOOTPROT/SmartEEPROM fuses on a blank chip). [`Boot::boot_or_enter_download`]
+//! then classifies the persisted [`BootStore`] and acts
+//! on it, booting the active image, swapping to roll back, or returning so
+//! the binary can enter download mode; a caller wanting its own policy reads
+//! [`Boot::disposition`] and matches the outcomes itself.
+//!
+//! It returns for download mode in exactly two cases: no bootable image in
+//! either bank, or the application asked for an update. In download mode the
+//! binary drives its own transport and calls [`Boot::install`], which streams
+//! an image into the inactive slot, records a trial, and swaps. When to give
+//! up (a silence timeout, a retry budget) is the binary's policy, since it
+//! owns the transport. [`Boot::verify`] gates the boot-through-active path and
+//! [`Boot::revert`] the rollback path.
+//!
+//! ## Application flow
+//!
+//! The application links this crate for [`client::BootClient`], built over
+//! the same [`persist::BootStorage`] the bootloader uses (the app constructs
+//! a store at the same offset and hands it in). Early in init it calls
+//! [`confirm`](client::BootClient::confirm) to mark a trial image good and
+//! take over the trial watchdog, or [`reject`](client::BootClient::reject)
+//! to condemn the running image; [`request_update`](client::BootClient::request_update)
+//! asks BOOT to enter download mode on the next boot, and
+//! [`boot_state`](client::BootClient::boot_state) reads the previous boot's
+//! outcome for upstream reporting.
+//!
+//! `examples/boot-skeleton/` is a minimal BOOT binary and a faithful
+//! downstream setup (its own memory.x, build.rs, and cargo config).
+//! `examples/boot-demo/` plus `examples/trial-app/` are a runnable on-ramp:
+//! `examples/build-demo.sh` stamps a small RTT app and embeds it in a BOOT
+//! that installs, swaps, and boots into it, so a first bench bring-up needs
+//! no transport (see `scripts/provision-boot.sh`).
 #![no_std]
 #![no_main]
 
@@ -13,6 +106,7 @@ use core::marker::PhantomData;
 
 use atsamd_hal as hal;
 
+pub mod boot_info;
 pub mod client;
 pub mod consts;
 mod flash_writer;
@@ -22,7 +116,7 @@ pub mod persist;
 pub use flash_writer::FlashError;
 
 use embedded_hal_02::watchdog::WatchdogEnable;
-use hal::nvm::PhysicalBank;
+use hal::nvm::{PhysicalBank, UserpageStatus};
 use hal::watchdog::{Watchdog, WatchdogTimeout};
 
 use crate::{
@@ -41,6 +135,13 @@ fn see_reserve(nvm: &hal::nvm::Nvm) -> usize {
     2 * regs.seestat().read().sblk().bits() as usize * 8192
 }
 
+/// The bootloader state machine, owning the peripherals it drives (NVM,
+/// DSU, watchdog) and the [`BootConfig`] policy. `S` is a [`SlotState`]
+/// typestate that records whether the active slot has been verified this
+/// boot: only [`Boot::verify`] produces a [`Boot<Verified>`], and only that
+/// unlocks [`boot_active`](Boot::<Verified>::boot_active). Construct with
+/// [`Boot::new`] or [`Boot::init`]; hand the peripherals back with
+/// [`Boot::free`].
 pub struct Boot<S: SlotState> {
     nvm: hal::nvm::Nvm,
     dsu: hal::dsu::Dsu,
@@ -53,15 +154,24 @@ mod seal {
     pub trait Sealed {}
 }
 
-/// Track whether the Active/Inactive Slots have been verified This Boot
+/// Sealed typestate marking whether [`Boot`]'s active slot has been verified
+/// this boot: either [`Unverified`] or [`Verified`].
 pub trait SlotState: seal::Sealed {}
+
+/// The active slot has not been verified this boot; the boot-through path is
+/// locked. The initial state of a freshly constructed [`Boot`].
 pub struct Unverified {}
 impl seal::Sealed for Unverified {}
 impl SlotState for Unverified {}
+
+/// The active slot passed integrity verification this boot, reached only
+/// through [`Boot::verify`]. Unlocks [`Boot::<Verified>::boot_active`].
 pub struct Verified {}
 impl seal::Sealed for Verified {}
 impl SlotState for Verified {}
 
+/// Downstream-set boot policy: how many trial attempts an image gets and how
+/// tightly the watchdog is armed while it is on trial.
 pub struct BootConfig {
     /// Trial boots of one image before it is reverted
     pub max_boot_attempts: u8,
@@ -69,14 +179,17 @@ pub struct BootConfig {
     pub trial_timeout: WatchdogTimeout,
 }
 
+/// A precondition [`Boot::new`] found unmet: the live fuse configuration is
+/// incompatible with a swap-safe layout. [`Boot::init`] fixes the fixable
+/// cases instead of returning these.
 pub enum BootConfigError {
     BootprotMisconfigured,
     SmartEEPROMTooLarge,
-    /// SBLK 11..=15: reserved encodings; BKSWRST skips SEE reallocation
-    /// and no reserve size can be derived from them.
     SmartEEPROMReservedSblk,
 }
 
+/// Why an image failed integrity verification. Checked cheap-to-expensive,
+/// so the first failing check is the variant returned.
 pub enum VerifyError {
     BadMagic,
     VersionMismatch,
@@ -91,6 +204,9 @@ impl From<hal::dsu::Error> for VerifyError {
     }
 }
 
+/// Failure of the composed [`Boot::install`] verb. Each variant names the
+/// stage that failed: writing the image, verifying it, or persisting the
+/// trial record. `W` is the store's write-error type.
 pub enum InstallError<W> {
     Flash(FlashError),
     Verify(VerifyError),
@@ -102,19 +218,15 @@ pub enum InstallError<W> {
 /// for, so its own validation or bookkeeping can sit in each arm.
 pub enum Disposition {
     SteadyBoot,
-    /// `exhausted`: the count has reached `max_boot_attempts`; revert
-    /// rather than trying again.
+    /// `attempt` is this boot's 1-based trial count; `exhausted` is set once it
+    /// has reached `max_boot_attempts`, meaning revert rather than try again.
     Trial {
         attempt: u8,
         exhausted: bool,
     },
-    /// The trial image reported itself good; promote it and boot.
     Promote,
-    /// The application condemned the active image; revert it.
     Reject,
-    /// An install lost power before its swap.
     ResumeInstall,
-    /// Active image condemned; the other slot holds a valid one.
     Rollback,
     UpdateRequested,
     NoImage,
@@ -288,9 +400,50 @@ impl Boot<Unverified> {
 
     /// Infallibly construct the bootloader, configuring any fuses required.
     /// For use in "provisioning" call paths that assume blank-slate state.
-    pub fn init(nvm: hal::nvm::Nvm, dsu: hal::dsu::Dsu, wdt: Watchdog, config: BootConfig) -> Self {
-        // Maybe this needs to reboot rather than returning self
-        todo!();
+    ///
+    /// BOOTPROT and the SEE SBLK reserve live in the user page, which NVMCTRL
+    /// latches into STATUS/SEESTAT only during its startup sequence: the
+    /// bootloader-size fuse "is loaded from the NVM User page during the device
+    /// startup" and SBLK/PSZ "loaded after a reset" (DS §25.6.9), and aux-space
+    /// writes "take effect after the next reset. Therefore, a boot of the device
+    /// is needed" (DS §25.6.5). So a corrected fuse is inert until a reset. This
+    /// fn writes only what must change; if that changed the page it reboots to
+    /// reload it (diverging via [`cortex_m::peripheral::SCB::sys_reset`], after
+    /// which provisioning re-runs and returns on the second pass), and returns
+    /// `self` directly for a chip whose fuses were already correct.
+    pub fn init(
+        mut nvm: hal::nvm::Nvm,
+        dsu: hal::dsu::Dsu,
+        wdt: Watchdog,
+        config: BootConfig,
+    ) -> Self {
+        // SAFETY: the setters touch only the BOOTPROT and SEE SBLK fields;
+        // `modify_userpage` reads back and rewrites every other user-page byte
+        // (factory BOD12 calibration included) unchanged, and skips the
+        // erase/write entirely when nothing changed.
+        let updated = matches!(
+            unsafe {
+                nvm.modify_userpage(|page| {
+                    page.set_nvm_bootloader_size(BOOTPROT_VALUE);
+                    // SBLK 11..=15 is a reserved encoding, not a usable reserve:
+                    // BKSWRST skips SEE reallocation and no reserve size derives
+                    // from it, so disable SEE. A valid SBLK (0..=10) is the
+                    // application's own reserve; leave it be.
+                    if page.see_sblk() > 10 {
+                        page.set_see_sblk(0);
+                    }
+                })
+            },
+            // An erase/write failure leaves the page in an unknown state; reboot
+            // to replay provisioning from a clean startup rather than hand back a
+            // Boot over unverified fuses.
+            Ok(UserpageStatus::Updated) | Err(_)
+        );
+
+        if updated {
+            cortex_m::peripheral::SCB::sys_reset()
+        }
+
         Boot {
             nvm,
             dsu,

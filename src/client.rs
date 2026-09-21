@@ -33,15 +33,22 @@ pub struct BootOutcome {
     pub revert_reason: u8,
 }
 
+/// The application-side handle over the shared [`BootStorage`]. Constructed
+/// once in the application from a store opened at the same offset the
+/// bootloader uses; drives the confirm/reject/update mailbox and reads the
+/// last boot's outcome.
 pub struct BootClient<St> {
     store: St,
 }
 
 impl<St: BootStorage> BootClient<St> {
+    /// Wrap a store the application already opened (at the bootloader's
+    /// offset).
     pub fn new(store: St) -> Self {
         Self { store }
     }
 
+    /// Recover the wrapped store.
     pub fn free(self) -> St {
         self.store
     }

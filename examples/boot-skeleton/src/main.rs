@@ -1,14 +1,14 @@
-//! Minimal end-to-end BOOT-role binary: decide what to do from the
-//! stored boot record (boot / roll back / update), and when that decision
-//! is "wait for an update", stream a new image in over a transport. TRNG
-//! stands in as the transport here. It needs no pins, so the skeleton
-//! stays valid for every supported part, and it exercises the real
-//! byte-stream seam (a deployment swaps in any `Iterator<Item = u8>`:
-//! UART, USB, CAN, …). Random bytes never pass verification, so this
-//! also drives the reject path.
+//! Minimal end-to-end BOOT binary, and a faithful downstream setup: its
+//! own `memory.x` selects the BOOT role with `INCLUDE samd5_boot_boot.x`,
+//! its `build.rs` puts that on the link path, and `.cargo/config.toml`
+//! links with `-Tlink.x`. Copy this crate's structure for a real BOOT.
 //!
-//! Also tracks `.text` against the 32 KiB budget. Build with e.g.
-//! `cargo build --release --example boot-skeleton --target thumbv7em-none-eabihf --features samd51j20a`
+//! It decides what to do from the stored boot record (boot / roll back /
+//! update) and, when the decision is "wait for an update", streams a new
+//! image in over a transport. TRNG stands in as the transport: it needs no
+//! pins, so this stays valid for every supported part, and it exercises the
+//! real byte-stream seam (a deployment swaps in any `Iterator<Item = u8>`:
+//! UART, USB, CAN). Random bytes never verify, so this also drives reject.
 #![no_std]
 #![no_main]
 
@@ -17,11 +17,21 @@ use hal::trng::Trng;
 use hal::watchdog::{Watchdog, WatchdogTimeout};
 use samd5_boot::{
     Boot, BootConfig,
+    boot_info::{self, BootInfo},
+    consts, install_boot_info,
     persist::{BootStorage, SmartEepromStore},
 };
 
 /// A plausible image length to pull from the stand-in transport.
 const DEMO_IMAGE_LEN: usize = 4096;
+
+install_boot_info!(BootInfo {
+    magic: boot_info::MAGIC,
+    abi_version: boot_info::ABI_VERSION,
+    transport_version: 1,
+    boot_size: consts::BOOT_SIZE as u32,
+    build_id: 0,
+});
 
 struct TrngBytes(Trng);
 

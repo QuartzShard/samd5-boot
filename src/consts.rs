@@ -69,8 +69,13 @@ pub use density::{FLASH_SIZE, RAM_SIZE};
 
 // ── Derived geometry ────────────────────────────────────────────────────
 
+/// One physical bank: half the flash. A bank maps to either slot; the size
+/// is the same in both roles.
 pub const BANK_SIZE: usize = FLASH_SIZE / 2;
+/// Base of the active slot: the mapped-low bank, always at the flash base.
 pub const ACTIVE_SLOT_ADDR: usize = FLASH_ADDR;
+/// Base of the inactive slot: the mapped-high bank, in the upper half. The
+/// download target and the swap destination.
 pub const INACTIVE_SLOT_ADDR: usize = FLASH_ADDR + BANK_SIZE;
 pub const BLOCKS_PER_BANK: usize = BANK_SIZE / ERASE_BLOCK_SIZE;
 pub const FLASH_PAGES: usize = FLASH_SIZE / PAGE_SIZE;
@@ -104,7 +109,18 @@ pub const BOOTPROT_VALUE: u8 = (15 - BOOT_SIZE / BOOTPROT_GRANULE) as u8;
 ))]
 const _: () = assert!(BOOT_SIZE < BANK_SIZE && BOOT_SIZE.is_multiple_of(LOCK_REGION_SIZE));
 
-// Place after vector table
+/// Fixed location of the boot-info block: the top page of the BOOT
+/// region. BOOT pins [`BootInfo`](crate::boot_info::BootInfo) here (via
+/// `samd5_boot_boot.x`) and the application reads it at this absolute
+/// address. Derived from BOOT_SIZE so BOOT and app agree (both build with
+/// the same bootprot-* feature); a whole page is reserved so append-only
+/// ABI growth never moves the address.
+pub const BOOT_INFO_ADDR: usize = ACTIVE_SLOT_ADDR + BOOT_SIZE - PAGE_SIZE;
+
+/// Offset of the [`AppManifest`](crate::manifest::AppManifest) within the app
+/// region: past the largest vector table, on the 1 KiB VTOR granule. BOOT
+/// reads the manifest at `app_begin + MANIFEST_OFFSET`; the app links it there
+/// via `samd5_boot_app.x`.
 pub const MANIFEST_OFFSET: usize = 0x400;
 
 const _: () = assert!(MANIFEST_OFFSET >= (16 + 137) * 4);

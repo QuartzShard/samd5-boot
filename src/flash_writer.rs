@@ -10,7 +10,9 @@
 use crate::consts::{self, ERASED, PAGE_SIZE_WORDS};
 use atsamd_hal::nvm::{self, Nvm, WriteGranularity};
 
+/// A failure while writing an image into the inactive slot.
 pub enum FlashError {
+    /// An erase or program command returned an NVMCTRL error.
     Nvm(nvm::Error),
     /// The stream ran past the writer's `end` bound.
     ImageTooLarge,

@@ -1,0 +1,14 @@
+[package]
+name = "boot-skeleton"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace root so this example is not absorbed into a parent.
+[workspace]
+
+[dependencies]
+samd5-boot = { path = "../..", features = ["samd51j20a"] }
+atsamd-hal = "0.23.4"
+cortex-m = { version = "0.7.9", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
