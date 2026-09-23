@@ -1,32 +1,76 @@
 //! Persistent bootloader storage. Used for counting boot trials, anti-rollback, etc
 //! Includes the layout of stored data, and a trait to implement to provide a backend.
 //!
-//! Every sub-struct of [`BootStore`] is exactly one 32-bit word: the
-//! unit a backend must write power-atomically, and each word has a
-//! single writer (BOOT for [`BootState`] and [`Rollback`], the
-//! application for [`UpdateMailbox`]). All-zeros decodes as the safe
-//! fresh-chip default throughout.
+//! Every sub-struct of [`BootStore`] is exactly one 32-bit word: the unit a
+//! backend must write power-atomically. The record carries a checksum over
+//! those words, so a backing store that was never written, or a write torn
+//! by a power cut, is detected and reported as the fresh default rather than
+//! trusted. That matters because "unwritten" is not zeros everywhere: an
+//! erased SmartEEPROM region reads as 0xFF, which would otherwise decode as
+//! every mailbox flag set and a spent trial budget.
 
+#[cfg(feature = "target")]
 use core::convert::Infallible;
 
+#[cfg(feature = "target")]
 use atsamd_hal::{nvm::PhysicalBank, pac::Nvmctrl};
 
+#[cfg(feature = "target")]
 use crate::consts::SEEPROM_ADDR;
 
-/// The full persisted boot record: three single-word sub-structs, each
-/// written independently and power-atomically (see [`BootStorage`]). Read at
-/// boot and rewritten as state advances.
+/// The full persisted boot record (see [`BootStorage`]). Read at boot and
+/// rewritten as state advances.
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy, Default)]
 #[repr(C)]
 pub struct BootStore {
     pub boot_state: BootState,
     pub rollback: Rollback,
     pub mailbox: UpdateMailbox,
+    checksum: u32,
 }
 
 const _: () = assert!(
     size_of::<BootState>() == 4 && size_of::<Rollback>() == 4 && size_of::<UpdateMailbox>() == 4
 );
+const _: () = assert!(size_of::<BootStore>() == 16);
+
+impl BootStore {
+    /// Bytes the checksum covers: everything ahead of it.
+    const COVERED: usize = size_of::<BootStore>() - size_of::<u32>();
+
+    fn computed(&self) -> u32 {
+        crc32(&bytemuck::bytes_of(self)[..Self::COVERED])
+    }
+
+    /// Stamp the checksum. A backend's `write` does this, so a record on its
+    /// way to storage always carries a current one.
+    pub fn seal(&mut self) {
+        self.checksum = self.computed();
+    }
+
+    /// The record as stored, or `None` if the bytes do not check out.
+    pub fn validated(self) -> Option<Self> {
+        (self.checksum == self.computed()).then_some(self)
+    }
+}
+
+/// CRC-32/ISO-HDLC, the same convention [`crate::crc32`] pins with test
+/// vectors. Written table-free so BOOT, which otherwise never links that
+/// table, does not gain 1 KiB of .rodata for a twelve-byte record.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
 
 /// Implementation for storing and retrieving `BootStore` from whatever persistent storage you have
 /// in your system - SmartEEPROM backed impl provided.
@@ -40,12 +84,27 @@ pub unsafe trait BootStorage {
     type WriteErr;
     type ReadErr;
 
-    /// On ReadErr, you probably want to either retry or `unwrap_or_default()` (zeroed)
-    fn read(&mut self) -> Result<BootStore, Self::ReadErr>;
+    /// Hand back the stored bytes as they are, checksum unexamined.
+    fn read_raw(&mut self) -> Result<BootStore, Self::ReadErr>;
+
     /// Persist the record. Must honour the per-word power-atomicity in the
     /// trait's `# Safety` contract: only whole words may change, never a torn
     /// one.
-    fn write(&mut self, val: BootStore) -> Result<(), Self::WriteErr>;
+    fn write_raw(&mut self, val: BootStore) -> Result<(), Self::WriteErr>;
+
+    /// Read the record, falling back to the fresh default when the stored
+    /// bytes do not check out.
+    ///
+    /// This is the accessor to use; `read_raw` is the backend's hook.
+    fn read(&mut self) -> Result<BootStore, Self::ReadErr> {
+        Ok(self.read_raw()?.validated().unwrap_or_default())
+    }
+
+    /// Stamp the checksum and store the record.
+    fn write(&mut self, mut val: BootStore) -> Result<(), Self::WriteErr> {
+        val.seal();
+        self.write_raw(val)
+    }
 }
 
 /// Trial bookkeeping. Bank states are keyed by *physical* bank
@@ -65,6 +124,9 @@ pub struct BootState {
     reserved: u8,
 }
 
+/// Keyed by the hal's `PhysicalBank`, so these are the one part of the
+/// record that a host build cannot have.
+#[cfg(feature = "target")]
 impl BootState {
     const fn shift(bank: &PhysicalBank) -> u8 {
         match bank {
@@ -114,6 +176,7 @@ pub enum BankState {
 }
 
 impl BankState {
+    #[cfg(feature = "target")]
     const fn from_bits(bits: u8) -> Self {
         match bits & 0b11 {
             0 => Self::None,
@@ -206,26 +269,85 @@ unsafe impl BootStorage for NoStore {
     type ReadErr = core::convert::Infallible;
     type WriteErr = core::convert::Infallible;
 
-    fn read(&mut self) -> Result<BootStore, Self::ReadErr> {
+    fn read_raw(&mut self) -> Result<BootStore, Self::ReadErr> {
         Ok(BootStore::default())
     }
 
-    fn write(&mut self, _: BootStore) -> Result<(), Self::WriteErr> {
+    fn write_raw(&mut self, _: BootStore) -> Result<(), Self::WriteErr> {
         Ok(())
     }
 }
 
+/// [`BootStorage`] in backup RAM.
+///
+/// Backup RAM keeps its contents across any reset, including the one BKSWRST
+/// performs, so the whole trial and rollback cycle works normally. It does
+/// not survive loss of power: a cold boot reads as an unwritten store, which
+/// the checksum turns into the fresh default. That makes this the right
+/// backing for a bench rig, and for a product that is always powered and
+/// wants a blackout treated as a blank slate; anything that must remember a
+/// trial across a power cut needs [`SmartEepromStore`] or another
+/// non-volatile backing.
+///
+/// `OFFSET` is in bytes from the base of backup RAM, so the record can sit
+/// alongside whatever else the application keeps there.
+#[cfg(feature = "target")]
+pub struct BkupRamStore<const OFFSET: usize>(());
+
+#[cfg(feature = "target")]
+impl<const OFFSET: usize> BkupRamStore<OFFSET> {
+    /// # Safety
+    ///
+    /// Nothing else may use `OFFSET..OFFSET + size_of::<BootStore>()` of
+    /// backup RAM.
+    pub const unsafe fn new() -> Self {
+        const { assert!(OFFSET.is_multiple_of(4)) };
+        const {
+            assert!(OFFSET + size_of::<BootStore>() <= crate::consts::BKUPRAM_SIZE);
+        }
+        Self(())
+    }
+
+    fn ptr() -> *mut BootStore {
+        (crate::consts::BKUPRAM_ADDR + OFFSET) as *mut BootStore
+    }
+}
+
+// SAFETY: a 32-bit RAM write cannot tear, which is all the trait requires.
+#[cfg(feature = "target")]
+unsafe impl<const OFFSET: usize> BootStorage for BkupRamStore<OFFSET> {
+    type ReadErr = Infallible;
+    type WriteErr = Infallible;
+
+    fn read_raw(&mut self) -> Result<BootStore, Infallible> {
+        // SAFETY: in range per `new`, and every bit pattern is a valid
+        // BootStore, so uninitialised backup RAM reads as a rejected record
+        // rather than a fault.
+        Ok(unsafe { Self::ptr().read_volatile() })
+    }
+
+    fn write_raw(&mut self, val: BootStore) -> Result<(), Infallible> {
+        // SAFETY: as in `read_raw`.
+        unsafe { Self::ptr().write_volatile(val) };
+        Ok(())
+    }
+}
+
+#[cfg(feature = "target")]
 const STORE_WORDS: usize = size_of::<BootStore>() / 4;
 
 /// A word write to a locked SmartEEPROM is discarded silently; the
 /// read-back in [`SmartEepromStore`]'s `write` surfaces it as this.
+#[cfg(feature = "target")]
 pub struct SeeWriteFailed;
 
 /// Why [`SmartEepromStore::new`] rejected the live SmartEEPROM configuration.
-/// `SeeUnavailable`: SBLK 0 (disabled) or a reserved SBLK (11+). `SeeBuffered`:
-/// `SEECFG.WMODE` buffered, which defers word commits and voids per-word
-/// power-atomicity. `OffsetOutOfRange`: `OFFSET + size_of::<BootStore>()` past
-/// the configured virtual size.
+/// `SeeUnavailable`: SBLK 0 (disabled) or a reserved SBLK (11+). `SeeLocked`:
+/// `SEESTAT.LOCK` set (see [`SeeWriteFailed`]). `SeeBuffered`: `SEECFG.WMODE`
+/// buffered, which defers word commits and voids per-word power-atomicity.
+/// `OffsetOutOfRange`: `OFFSET + size_of::<BootStore>()` past the configured
+/// virtual size.
+#[cfg(feature = "target")]
 pub enum StoreConfigError {
     SeeUnavailable,
     SeeLocked,
@@ -236,8 +358,10 @@ pub enum StoreConfigError {
 /// [`BootStorage`] on SmartEEPROM. `OFFSET` is in bytes from the
 /// start of the virtual space, so the record coexists with application
 /// data stored elsewhere in it.
+#[cfg(feature = "target")]
 pub struct SmartEepromStore<const OFFSET: usize>(());
 
+#[cfg(feature = "target")]
 impl<const OFFSET: usize> SmartEepromStore<OFFSET> {
     /// Validates the live SmartEEPROM configuration against `OFFSET`.
     ///
@@ -283,11 +407,12 @@ impl<const OFFSET: usize> SmartEepromStore<OFFSET> {
 
 // SAFETY: in unbuffered mode each 32-bit SEE write is journaled by the
 // EEPROM emulation providing per-word power-atomicity.
+#[cfg(feature = "target")]
 unsafe impl<const OFFSET: usize> BootStorage for SmartEepromStore<OFFSET> {
     type ReadErr = Infallible;
     type WriteErr = SeeWriteFailed;
 
-    fn read(&mut self) -> Result<BootStore, Infallible> {
+    fn read_raw(&mut self) -> Result<BootStore, Infallible> {
         let mut words = [0u32; STORE_WORDS];
         for (i, word) in words.iter_mut().enumerate() {
             Self::wait_ready();
@@ -297,7 +422,7 @@ unsafe impl<const OFFSET: usize> BootStorage for SmartEepromStore<OFFSET> {
         Ok(bytemuck::cast(words))
     }
 
-    fn write(&mut self, val: BootStore) -> Result<(), SeeWriteFailed> {
+    fn write_raw(&mut self, val: BootStore) -> Result<(), SeeWriteFailed> {
         let words: [u32; STORE_WORDS] = bytemuck::cast(val);
         for (i, &word) in words.iter().enumerate() {
             let ptr = Self::word_ptr(i);
@@ -315,5 +440,21 @@ unsafe impl<const OFFSET: usize> BootStorage for SmartEepromStore<OFFSET> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crc32;
+
+    /// Host tooling seals a record the target then validates, so this has to
+    /// stay byte-identical to the image convention [`crate::crc32`] pins.
+    #[test]
+    fn record_crc_matches_the_image_convention() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        let record: [u8; 12] = [
+            0x02, 0x03, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(crc32(&record), crate::crc32::crc32(&record));
     }
 }

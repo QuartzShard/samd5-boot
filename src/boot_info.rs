@@ -32,9 +32,7 @@ pub const ABI_VERSION: u16 = 1;
 const _: () = assert!(size_of::<BootInfo>() <= consts::PAGE_SIZE);
 
 /// Read the boot-info block the running BOOT embedded, from its fixed
-/// location at the top of the BOOT region. The application calls this to
-/// audit BOOT/app compatibility; every bit pattern is a valid [`BootInfo`],
-/// so check `magic` against [`MAGIC`] before trusting the rest.
+/// location at the top of the BOOT region.
 pub fn read() -> BootInfo {
     // SAFETY: BOOT_INFO_ADDR is a fixed, always-populated flash location
     // holding a BootInfo (pinned by samd5_boot_boot.x).

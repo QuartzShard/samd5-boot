@@ -1,0 +1,37 @@
+[package]
+name = "demo-boot"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace root so this binary is not absorbed into a parent.
+[workspace]
+
+[features]
+# The link BOOT listens on. RTT needs only the debug probe that put BOOT on
+# the part, so it is the default; RS485 additionally needs a transceiver, and
+# is what proves an update works with no debugger in the loop.
+default = ["rtt"]
+rtt = ["dep:demo-rtt"]
+rs485 = ["dep:demo-serial"]
+
+[dependencies]
+samd5-boot = { path = "../../..", features = ["samd51j20a"] }
+demo-rtt = { path = "../demo-rtt", optional = true }
+demo-serial = { path = "../demo-serial", optional = true }
+proto = { path = "../proto" }
+atsamd-hal = "0.23.4"
+cortex-m = { version = "0.7.9", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtt-target = "0.5"
+
+# The BOOT region is 32 KiB minus the boot-info page, so the binary is
+# optimized for size rather than speed; nothing here is hot. An unoptimized
+# build does not fit (the linker says so), hence dev is size-optimized too.
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

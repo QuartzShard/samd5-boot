@@ -12,13 +12,11 @@ use hal::{
     watchdog::{Watchdog, WatchdogTimeout},
 };
 
-use crate::persist::BootStorage;
+use crate::persist::{BootStorage, UpdateMailbox};
 
 /// What [`BootClient::confirm`] did with the watchdog.
 pub enum WdtHandoff {
-    /// Reconfigured to the requested period and left running.
     Reconfigured,
-    /// Disabled; the application owns watchdog setup from here.
     Disabled,
     /// `CTRLA.ALWAYSON` is fused: the watchdog can be neither disabled
     /// nor reconfigured, only fed. The application is stuck with the
@@ -33,10 +31,8 @@ pub struct BootOutcome {
     pub revert_reason: u8,
 }
 
-/// The application-side handle over the shared [`BootStorage`]. Constructed
-/// once in the application from a store opened at the same offset the
-/// bootloader uses; drives the confirm/reject/update mailbox and reads the
-/// last boot's outcome.
+/// The application-side handle over the shared [`BootStorage`]: the
+/// confirm/reject/update mailbox and the last boot's outcome.
 pub struct BootClient<St> {
     store: St,
 }
@@ -51,6 +47,12 @@ impl<St: BootStorage> BootClient<St> {
     /// Recover the wrapped store.
     pub fn free(self) -> St {
         self.store
+    }
+
+    fn set_flag(&mut self, f: impl FnOnce(&mut UpdateMailbox)) -> Result<(), St::WriteErr> {
+        let mut record = self.store.read().unwrap_or_default();
+        f(&mut record.mailbox);
+        self.store.write(record)
     }
 
     /// Read what the bootloader recorded on the way to this boot.
@@ -75,9 +77,7 @@ impl<St: BootStorage> BootClient<St> {
     ) -> Result<WdtHandoff, St::WriteErr> {
         wdt.feed();
 
-        let mut record = self.store.read().unwrap_or_default();
-        record.mailbox.set_confirmed(true);
-        self.store.write(record)?;
+        self.set_flag(|mailbox| mailbox.set_confirmed(true))?;
 
         // SAFETY: read-only status access
         let always_on = unsafe { &*Wdt::ptr() }.ctrla().read().alwayson().bit_is_set();
@@ -98,15 +98,11 @@ impl<St: BootStorage> BootClient<St> {
     /// if the write cannot land, the trial watchdog and attempt counter
     /// remain the backstop.
     pub fn reject(&mut self) -> Result<(), St::WriteErr> {
-        let mut record = self.store.read().unwrap_or_default();
-        record.mailbox.set_rejected(true);
-        self.store.write(record)
+        self.set_flag(|mailbox| mailbox.set_rejected(true))
     }
 
     /// Ask the bootloader to enter download mode on the next boot.
     pub fn request_update(&mut self) -> Result<(), St::WriteErr> {
-        let mut record = self.store.read().unwrap_or_default();
-        record.mailbox.set_request_update(true);
-        self.store.write(record)
+        self.set_flag(|mailbox| mailbox.set_request_update(true))
     }
 }

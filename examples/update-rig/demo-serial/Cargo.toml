@@ -1,0 +1,20 @@
+[package]
+name = "demo-serial"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace root so this crate is not absorbed into a parent.
+[workspace]
+
+[features]
+default = ["samd51j20a"]
+# Part-level naming mirrors samd5-boot so downstream firmware can enable the
+# same feature name on both. atsamd-hal only carries variant features (no
+# flash-density suffix), so this forwards to `samd51j`.
+samd51j20a = ["atsamd-hal/samd51j", "atsamd-hal/samd51j-rt"]
+
+[dependencies]
+atsamd-hal = "0.23.4"
+cortex-m = "0.7.9"
+demo-rig = { path = "../demo-rig" }

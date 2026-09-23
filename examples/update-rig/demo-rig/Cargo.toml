@@ -1,0 +1,13 @@
+[package]
+name = "demo-rig"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace, like every other crate here.
+[workspace]
+
+[dependencies]
+# For the backup-RAM geometry these offsets are relative to. Host-buildable,
+# so `xtask` can use the same constants the firmware does.
+samd5-boot = { path = "../../..", default-features = false }

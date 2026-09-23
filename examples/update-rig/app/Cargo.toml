@@ -1,0 +1,27 @@
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace root so this crate is not absorbed into a parent.
+[workspace]
+
+[features]
+default = ["rtt"]
+# The link this image answers on. Must match what BOOT was built with.
+rtt = ["dep:demo-rtt"]
+rs485 = ["dep:demo-serial"]
+# Skip the confirm call, so BOOT eventually rolls this image back.
+noconfirm = []
+
+[dependencies]
+samd5-boot = { path = "../../..", features = ["samd51j20a"] }
+demo-rtt = { path = "../demo-rtt", optional = true }
+demo-serial = { path = "../demo-serial", optional = true }
+proto = { path = "../proto" }
+# Same version samd5-boot and demo-serial use, so the pac/gpio types unify.
+atsamd-hal = { version = "0.23.4", features = ["samd51j"] }
+cortex-m = { version = "0.7.9", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+rtt-target = "0.5"

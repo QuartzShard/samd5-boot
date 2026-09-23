@@ -1,11 +1,7 @@
 //! Emits `density` / `boot_size` cfgs from the selected features.
-//! Target selection lists each part exactly once (here), and generates the role
-//! linker fragments, written to OUT_DIR and found through
-//! `rustc-link-search`: a downstream binary's own memory.x selects its
-//! role with a single `INCLUDE samd5_boot_boot.x` (or `_app`) line, which
-//! supplies MEMORY, the manifest slot, and `_stext`, composing with the
-//! stock cortex-m-rt `-Tlink.x` flow. memory.x stays the project's file,
-//! so a crate doing its own linking is never fought over it.
+//! Target selection lists each part exactly once (here). The role linker
+//! fragments are written to OUT_DIR and found through `rustc-link-search`;
+//! see the crate docs for how a downstream memory.x pulls one in.
 //!
 //! Products using SmartEEPROM set `SAMD5_BOOT_SEE_SBLK` (the SBLK fuse
 //! value, default 0) so the app region's top drops by the SEE reserve.
@@ -100,13 +96,10 @@ fn main() {
     };
     let bank_size = (1usize << digit) / 2;
     let boot_len = 1024
-        * match boot_size {
-            "16k" => 16,
-            "32k" => 32,
-            "64k" => 64,
-            "96k" => 96,
-            _ => unreachable!(),
-        };
+        * boot_size
+            .trim_end_matches('k')
+            .parse::<usize>()
+            .expect("bootprot feature names are <n>k");
 
     println!("cargo::rerun-if-env-changed=SAMD5_BOOT_SEE_SBLK");
     let sblk: usize = match env::var("SAMD5_BOOT_SEE_SBLK") {

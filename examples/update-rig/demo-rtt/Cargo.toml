@@ -1,0 +1,12 @@
+[package]
+name = "demo-rtt"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace, like every other crate here.
+[workspace]
+
+[dependencies]
+demo-rig = { path = "../demo-rig" }
+rtt-target = "0.5"

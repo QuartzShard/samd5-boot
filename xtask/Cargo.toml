@@ -1,0 +1,31 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone workspace, like every crate under examples/: probe-rs pulls in
+# ~240 crates, and none of that should land in the library's build graph.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Pinned exactly: probe-rs is pre-1.0 and its API moves between minor
+# versions. This is the release that has been driving this hardware, so a
+# bump is a deliberate step with a bench run behind it, not a caret.
+probe-rs = "=0.30.0"
+# The flash ABI, from the crate that defines it: manifest layout, CRC
+# convention and fuse encodings all come from here rather than being
+# restated, so tooling and firmware cannot drift apart.
+samd5-boot = { path = "..", default-features = false }
+# The demo's wire protocol, shared with the firmware so the host cannot
+# disagree with it about a variant index.
+proto = { path = "../examples/update-rig/proto", features = ["std"] }
+# Where the rig keeps its boot record, from the crate the firmware takes it
+# from, so the debugger-side request cannot land at a different offset.
+demo-rig = { path = "../examples/update-rig/demo-rig" }
+bytemuck = "1.25.2"
+# default features are only libudev-backed port enumeration; we open one
+# known path, so skipping them drops the system libudev build dependency.
+serialport = { version = "4.8", default-features = false }

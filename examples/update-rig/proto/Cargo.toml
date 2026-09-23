@@ -1,0 +1,21 @@
+[package]
+name = "proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace root: proto is build-verified in isolation and consumed
+# by the firmware / host crates as a plain path dependency, so it must not be
+# absorbed into some parent workspace that would fix a single build target.
+[workspace]
+
+[features]
+# Default is no_std + no alloc (firmware path). `std` only flips the underlying
+# crates' std helpers on for a host that wants them; the encode/decode helpers
+# here are identical either way.
+default = []
+std = ["serde/std", "postcard/use-std"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+postcard = { version = "1", default-features = false }

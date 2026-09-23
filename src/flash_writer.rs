@@ -26,6 +26,8 @@ impl From<nvm::Error> for FlashError {
 
 type Page = [u32; PAGE_SIZE_WORDS];
 
+const ERASED_BYTE: u8 = ERASED.to_le_bytes()[0];
+
 pub struct FlashWriter<'nvm> {
     nvm: &'nvm mut Nvm,
     begin: usize,
@@ -44,8 +46,7 @@ impl<'nvm> FlashWriter<'nvm> {
     pub unsafe fn new(nvm: &'nvm mut Nvm, begin: usize, end: usize) -> Self {
         // Errata 2.14.1: NVM reads corrupt while the page buffer is being
         // written; workaround = CTRLA.CACHEDIS0/1 while programming.
-        // `modify`, not `write`: CTRLA also carries RWS/AUTOWS/WMODE. The
-        // prior cache state is restored on drop rather than assumed on.
+        // `modify`, not `write`: CTRLA also carries RWS/AUTOWS/WMODE.
         let saved_cachedis = unsafe {
             let ctrla = nvm.registers().ctrla();
             let prior = ctrla.read();
@@ -105,9 +106,9 @@ pub fn words(mut bytes: impl Iterator<Item = u8>) -> impl Iterator<Item = u32> {
     core::iter::from_fn(move || {
         Some(u32::from_le_bytes([
             bytes.next()?,
-            bytes.next().unwrap_or(0xFF),
-            bytes.next().unwrap_or(0xFF),
-            bytes.next().unwrap_or(0xFF),
+            bytes.next().unwrap_or(ERASED_BYTE),
+            bytes.next().unwrap_or(ERASED_BYTE),
+            bytes.next().unwrap_or(ERASED_BYTE),
         ]))
     })
 }
