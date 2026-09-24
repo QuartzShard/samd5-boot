@@ -21,6 +21,8 @@ pub const MAX_FRAME: usize = 32;
 /// Outcome of an install attempt, reported device -> host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
+    /// The device never sends this: a successful install swaps banks and
+    /// reboots, so success is signalled by silence.
     Ok,
     VerifyFailed,
     FlashError,
@@ -51,9 +53,10 @@ pub enum Message {
     /// host -> device; answered with `State`.
     GetState,
     /// device -> host: `app_version` is the running image's own build
-    /// version, `revert_reason` is a `persist::reason` code recording the
-    /// last rollback, and `confirmed` says whether this image marked itself
-    /// good on this boot.
+    /// version, `revert_reason` is a `persist::RevertReason` code recording
+    /// the last rollback, carried raw so a code this build cannot decode
+    /// still arrives (a postcard enum would reject the whole frame), and
+    /// `confirmed` says whether this image marked itself good on this boot.
     State {
         app_version: u16,
         revert_reason: u8,

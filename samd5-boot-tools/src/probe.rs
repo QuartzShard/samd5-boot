@@ -33,13 +33,24 @@ const CACHEDIS: u16 = (1 << 14) | (1 << 15);
 /// `CTRLB.CMDEX`: a command executes only with this key in bits 15:8.
 const CMD_KEY: u16 = 0xA500;
 
-pub mod cmd {
-    pub const EP: u8 = 0;
-    pub const WQW: u8 = 4;
-    pub const LR: u8 = 17;
-    pub const UR: u8 = 18;
-    pub const PBC: u8 = 21;
-    pub const BKSWRST: u8 = 23;
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum Cmd {
+    Ep = 0,
+    Wqw = 4,
+    Pbc = 21,
+    Bkswrst = 23,
+}
+
+impl Cmd {
+    fn name(self) -> &'static str {
+        match self {
+            Cmd::Ep => "EP (erase page)",
+            Cmd::Wqw => "WQW (write quad word)",
+            Cmd::Pbc => "PBC (page buffer clear)",
+            Cmd::Bkswrst => "BKSWRST (bank swap and reset)",
+        }
+    }
 }
 
 /// `INTFLAG` bits that mean the last command failed. DONE (bit 0) is the
@@ -198,9 +209,9 @@ impl Nvm<'_> {
     ///
     /// Stale error flags make the next command look like it failed, so they
     /// are cleared first; this mirrors the hal's `command_sync`.
-    pub fn command(&mut self, cmd: u8) -> Result<()> {
+    pub fn command(&mut self, cmd: Cmd) -> Result<()> {
         if !self.mode.writes() {
-            println!("      CTRLB = {:#06x}  ({})", CMD_KEY | cmd as u16, cmd_name(cmd));
+            println!("      CTRLB = {:#06x}  ({})", CMD_KEY | cmd as u16, cmd.name());
             return Ok(());
         }
         self.core
@@ -208,14 +219,14 @@ impl Nvm<'_> {
             .context("clearing INTFLAG")?;
         self.core
             .write_word_16(CTRLB, CMD_KEY | cmd as u16)
-            .with_context(|| format!("issuing {}", cmd_name(cmd)))?;
+            .with_context(|| format!("issuing {}", cmd.name()))?;
 
         let deadline = Instant::now() + CMD_TIMEOUT;
         loop {
             let flags = self.core.read_word_16(INTFLAG).context("polling INTFLAG")?;
             if flags & ERRORS != 0 {
                 self.core.write_word_16(INTFLAG, ALL_FLAGS).ok();
-                bail!("{} failed: INTFLAG={flags:#06x}{}", cmd_name(cmd), describe(flags));
+                bail!("{} failed: INTFLAG={flags:#06x}{}", cmd.name(), describe(flags));
             }
             if flags & 1 != 0 {
                 self.core
@@ -224,7 +235,7 @@ impl Nvm<'_> {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("{} did not complete within {CMD_TIMEOUT:?}", cmd_name(cmd));
+                bail!("{} did not complete within {CMD_TIMEOUT:?}", cmd.name());
             }
         }
     }
@@ -294,26 +305,13 @@ impl Nvm<'_> {
 impl Drop for Nvm<'_> {
     /// Leave the part running. Halting is how this type reaches NVMCTRL
     /// safely, so putting the core back is its job rather than something
-    /// every exit path has to remember: a dry run, an early return and a
-    /// failed command all used to leave the part stopped.
+    /// every exit path has to remember.
     ///
     /// Best effort, because a drop cannot report. The one case that fails
     /// here is a core that has just reset itself out from under us, which
     /// is running anyway.
     fn drop(&mut self) {
         let _ = self.core.run();
-    }
-}
-
-fn cmd_name(cmd: u8) -> &'static str {
-    match cmd {
-        cmd::EP => "EP (erase page)",
-        cmd::WQW => "WQW (write quad word)",
-        cmd::LR => "LR (lock region)",
-        cmd::UR => "UR (unlock region)",
-        cmd::PBC => "PBC (page buffer clear)",
-        cmd::BKSWRST => "BKSWRST (bank swap and reset)",
-        _ => "command",
     }
 }
 

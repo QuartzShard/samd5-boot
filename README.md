@@ -45,6 +45,17 @@ read-back after the reset that actually re-latches the fuses.
 
 ## Using it
 
+```toml
+[dependencies]
+samd5-boot = { version = "0.1", features = ["samd51j20a"] }
+```
+
+Selecting a part is how firmware asks for the driver; a part feature brings
+everything that touches the silicon with it. A plain dependency with no
+features is the flash ABI alone, which builds on a host: that is what host
+tooling depends on, so a stamper and a bootloader cannot disagree about a
+layout or a fuse encoding.
+
 Two binaries, both built against this crate with the same part and
 `bootprot-*` features, and both selecting their role in `memory.x`:
 
@@ -68,10 +79,11 @@ flash page buffer at a time and never has to fit in RAM. On success it does
 not return: the image is verified, the trial is recorded, and the bank swap
 reboots the part.
 
-The application reserves a manifest slot with `install_manifest!`, and
-`tools/manifest-tool` stamps the length and CRCs into it after linking. An
-image that has not been stamped will not verify. On a trial boot the
-application marks itself good:
+The application reserves a manifest slot with `install_manifest!`, and a
+post-link step fills in the length and CRCs with
+[`manifest::stamp`](https://docs.rs/samd5-boot/latest/samd5_boot/manifest/fn.stamp.html),
+which is in this crate and compiles on a host. An image that has not been
+stamped will not verify. On a trial boot the application marks itself good:
 
 ```rust
 BootClient::new(store).confirm(&mut wdt, Some(timeout))?;
@@ -80,9 +92,33 @@ BootClient::new(store).confirm(&mut wdt, Some(timeout))?;
 Without that call the watchdog fires, BOOT swaps back, and the previous
 image is running again.
 
-## Reproducing the test suite
+## Getting a bootloader onto a part
 
-On an ATSAMD51J20A with a debug probe attached, and nothing else:
+The operations that need a debug probe rather than a compiler (writing the
+fuses, placing BOOT at both bank heads, stamping an image) are
+[`samd5-boot-tools`](samd5-boot-tools), a separate crate because it drives
+probe-rs, which has no place in a `no_std` dependency.
+
+```
+cargo install samd5-boot-tools
+samd5-boot-tools --chip ATSAMD51J20A info
+samd5-boot-tools --chip ATSAMD51J20A provision --dry-run
+samd5-boot-tools --chip ATSAMD51J20A flash boot.bin
+```
+
+It is a library first: a project's own `xtask` can call `provision`, `flash`
+and `stamp` directly and keep them in its existing build, which is what the
+`cli` feature exists to be turned off for.
+
+## The rig
+
+`examples/update-rig` lives in the
+[repository](https://github.com/QuartzShard/samd5-boot) and is not published:
+it is the worked integration, not a product. Clone it to run the suite.
+
+It is also the test suite: every call path driven from a host and reported as
+PASS/FAIL, over RTT (which needs only a debug probe) or RS485. On an
+ATSAMD51J20A with a probe attached:
 
 ```
 cargo xtask provision --chip ATSAMD51J20A --dry-run   # review, then drop --dry-run
@@ -96,12 +132,11 @@ which needs a transceiver on PB02 / PB03 / PB00.
 [`examples/update-rig/README.md`](examples/update-rig/README.md) breaks that
 into its steps and explains what each assertion proves.
 
-## Tooling
-
-`cargo xtask` is the bench tooling, and it depends on this crate with
-`--no-default-features`: the manifest layout, the CRC convention and the
-BOOTPROT and lock-region encodings all come from the same definitions the
-firmware compiles against, so there is no second implementation to drift.
+`cargo xtask` drives the rig: it builds and stamps the demo images, speaks
+their wire protocol, and runs the suite, delegating the device operations to
+`samd5-boot-tools`. Both depend on this crate with no features, so the
+manifest layout, the CRC convention and the fuse encodings all come from the
+same definitions the firmware compiles against.
 
 ```
 cargo xtask info      --chip <CHIP>   what a part is configured as

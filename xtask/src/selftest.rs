@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use proto::{Message, Status};
-use samd5_boot::{manifest, persist::reason};
+use samd5_boot::{manifest, persist::RevertReason};
 
 use crate::image;
 use crate::link::{Link, Transport};
@@ -45,8 +45,14 @@ impl Report {
 
 struct AppState {
     version: u16,
-    reason: u8,
+    revert_reason: u8,
     confirmed: bool,
+}
+
+impl AppState {
+    fn reason(&self) -> Option<RevertReason> {
+        RevertReason::from_u8(self.revert_reason)
+    }
 }
 
 /// Poll `GetState` until the application answers.
@@ -72,7 +78,7 @@ fn wait_for_app<T: Transport>(link: &mut Link<T>, timeout: Duration) -> Result<A
             {
                 return Ok(AppState {
                     version: app_version,
-                    reason: revert_reason,
+                    revert_reason,
                     confirmed,
                 });
             }
@@ -194,18 +200,15 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
     let baseline = install_and_wait(link, &good_image);
     r.check(
         "install: a good image is accepted, booted, and confirms itself",
-        baseline
-            .as_ref()
-            .map_err(|e| anyhow!("{e:#}"))
-            .and_then(|s| {
-                if s.version != good_version {
-                    bail!("came back running version {}", s.version)
-                } else if !s.confirmed {
-                    bail!("image did not confirm")
-                } else {
-                    Ok(())
-                }
-            }),
+        baseline.and_then(|s| {
+            if s.version != good_version {
+                bail!("came back running version {}", s.version)
+            } else if !s.confirmed {
+                bail!("image did not confirm")
+            } else {
+                Ok(())
+            }
+        }),
     );
 
     // A corrupted image must be refused by CRC and must not displace the
@@ -253,14 +256,13 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
     r.check(
         "revert: an application that rejects itself is rolled back",
         (|| {
-            link.flush_input()?;
-            let _ = link.reconnect();
+            link.resync()?;
             link.send(&Message::Reject)?;
             let s = wait_for_app(link, APP_TIMEOUT)?;
             if s.version != good_version {
                 bail!("rolled back to version {} instead", s.version)
-            } else if s.reason != reason::APP_REJECTED {
-                bail!("revert reason was {} not APP_REJECTED", s.reason)
+            } else if s.reason() != Some(RevertReason::AppRejected) {
+                bail!("revert reason was {:?}", s.reason())
             } else {
                 Ok(())
             }
@@ -284,13 +286,10 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
                 if let Ok(s) = wait_for_app(link, APP_TIMEOUT)
                     && s.version == good_version
                 {
-                    return if s.reason == reason::ATTEMPTS_EXHAUSTED {
+                    return if s.reason() == Some(RevertReason::AttemptsExhausted) {
                         Ok(())
                     } else {
-                        Err(anyhow!(
-                            "reverted with reason {} not ATTEMPTS_EXHAUSTED",
-                            s.reason
-                        ))
+                        Err(anyhow!("revert reason was {:?}", s.reason()))
                     };
                 }
             }
@@ -303,13 +302,13 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
     r.check(
         "window: an application-requested reboot accepts a new image",
         install_and_wait(link, &good_image).and_then(|s| {
-            if s.version == good_version && s.reason == reason::NONE && s.confirmed {
+            if s.version == good_version && s.reason() == Some(RevertReason::None) && s.confirmed {
                 Ok(())
             } else {
                 bail!(
-                    "version {} reason {} confirmed {}",
+                    "version {} reason {:?} confirmed {}",
                     s.version,
-                    s.reason,
+                    s.reason(),
                     s.confirmed
                 )
             }

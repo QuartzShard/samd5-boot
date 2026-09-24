@@ -7,11 +7,11 @@
 //! back, and both ends of that have to be picked up again.
 //!
 //! The control block moves, because the two images are separate binaries
-//! whose blocks sit at different addresses, so each reconnect re-finds it.
-//! Scanning RAM for that is far too slow to do repeatedly, for the reason
-//! `demo_rig::RTT_POINTER_ADDR` documents, so the firmware publishes the
-//! address instead in that fixed backup-RAM slot. A reconnect is then two
-//! small reads.
+//! whose blocks sit at different addresses, so a reconnect has to be able
+//! to re-find it. Scanning RAM for that is far too slow to do repeatedly,
+//! for the reason `demo_rig::RTT_POINTER_ADDR` documents, so the firmware
+//! publishes the address instead in that fixed backup-RAM slot. A
+//! reconnect is then two small reads.
 //!
 //! **The slot is single-use.** Backup RAM survives a reset, so a value left
 //! in it would go on naming the previous image's block long after that block
@@ -21,6 +21,7 @@
 //! published since anyone last looked, and an absent one means nothing has
 //! changed hands, so whatever block is already attached is still the right
 //! one.
+//!
 //! The *debug session* can also die outright: a reset taken while the probe
 //! was mid-transaction leaves it unusable, and no amount of retrying on it
 //! recovers, so it is rebuilt from scratch when the core stops answering.
@@ -113,7 +114,7 @@ impl RttLink {
     /// that comes up after a reset zeroes it on its way through `.bss`, so
     /// the magic going away is how a handover is noticed.
     fn block_is_live(&mut self) -> bool {
-        let (Some(session), Some(rtt)) = (self.session.as_mut(), self.rtt.as_ref()) else {
+        let Some((session, rtt)) = self.parts() else {
             return false;
         };
         let held = rtt.ptr();
@@ -245,7 +246,7 @@ impl Transport for RttLink {
         let mut rest = bytes;
         let deadline = Instant::now() + Duration::from_secs(30);
         while !rest.is_empty() {
-            let (Some(session), Some(rtt)) = (self.session.as_mut(), self.rtt.as_mut()) else {
+            let Some((session, rtt)) = self.parts() else {
                 bail!("the RTT link is not attached");
             };
             let mut core = session.core(0).context("selecting core 0")?;

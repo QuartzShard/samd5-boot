@@ -61,6 +61,7 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
 
     println!("cargo::rustc-check-cfg=cfg(density, values(\"18\", \"19\", \"20\"))");
+    println!("cargo::rustc-check-cfg=cfg(density_known)");
     let selected_densities: Vec<(u32, usize)> = DENSITIES
         .iter()
         .filter(|(_, _, parts)| {
@@ -72,6 +73,9 @@ fn main() {
         .collect();
     for (digit, _) in &selected_densities {
         println!("cargo::rustc-cfg=density=\"{digit}\"");
+    }
+    if !selected_densities.is_empty() {
+        println!("cargo::rustc-cfg=density_known");
     }
 
     println!("cargo::rustc-check-cfg=cfg(boot_size, values(\"16k\", \"32k\", \"64k\", \"96k\"))");

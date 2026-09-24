@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use probe_rs::flashing::{BinOptions, DownloadOptions, Format, download_file_with_options};
 use samd5_boot::consts::geometry;
 
-use crate::probe::{Device, Mode, cmd};
+use crate::probe::{Cmd, Device, Mode};
 
 /// Long enough for the part to come back from a BKSWRST and be halted again.
 const RESWAP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -66,8 +66,8 @@ pub fn run(chip: &str, boot_bin: &Path, mode: Mode) -> Result<()> {
         swap(&mut device)?;
     }
 
-    verify(&mut device, &image, 0, "active")?;
-    verify(&mut device, &image, inactive, "inactive")?;
+    verify(&mut device, &image, 0)?;
+    verify(&mut device, &image, inactive)?;
     println!("both bank heads carry this BOOT");
 
     Ok(())
@@ -108,7 +108,7 @@ fn swap(device: &mut Device) -> Result<()> {
             if before.a_first { "B" } else { "A" }
         );
         // Errors show up as the re-halt below failing.
-        nvm.command(cmd::BKSWRST).ok();
+        nvm.command(Cmd::Bkswrst).ok();
     }
 
     let deadline = Instant::now() + RESWAP_TIMEOUT;
@@ -127,7 +127,8 @@ fn swap(device: &mut Device) -> Result<()> {
     }
 }
 
-fn verify(device: &mut Device, image: &[u8], base: u64, which: &str) -> Result<()> {
+fn verify(device: &mut Device, image: &[u8], base: u64) -> Result<()> {
+    let which = if base == 0 { "active" } else { "inactive" };
     let mut nvm = device.halted()?;
     let read = nvm.uncached(|nvm| {
         let mut buf = vec![0u8; image.len()];

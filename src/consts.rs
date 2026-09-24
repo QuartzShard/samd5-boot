@@ -104,13 +104,10 @@ mod density {
     pub const RAM_SIZE: usize = 256 * 1024;
 }
 
-#[cfg(all(
-    feature = "target",
-    not(any(density = "18", density = "19", density = "20"))
-))]
+#[cfg(all(feature = "target", not(density_known)))]
 compile_error!("samd5-boot: select exactly one chip feature (full part number, e.g. `samd51j20a`)");
 
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub use density::{FLASH_SIZE, RAM_SIZE};
 
 // ── Derived geometry ────────────────────────────────────────────────────
@@ -120,17 +117,17 @@ pub const ACTIVE_SLOT_ADDR: usize = FLASH_ADDR;
 
 /// One physical bank: half the flash. A bank maps to either slot; the size
 /// is the same in both roles.
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub const BANK_SIZE: usize = geometry::bank_size(FLASH_SIZE);
 /// Base of the inactive slot: the mapped-high bank, in the upper half. The
 /// download target and the swap destination.
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub const INACTIVE_SLOT_ADDR: usize = FLASH_ADDR + BANK_SIZE;
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub const BLOCKS_PER_BANK: usize = BANK_SIZE / ERASE_BLOCK_SIZE;
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub const FLASH_PAGES: usize = FLASH_SIZE / PAGE_SIZE;
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub const LOCK_REGION_SIZE: usize = geometry::lock_region_size(FLASH_SIZE);
 
 // ── BOOT region (`boot_size` cfg emitted by build.rs) ───────────────────
@@ -155,10 +152,7 @@ pub const BOOTPROT_VALUE: u8 = geometry::bootprot_value(BOOT_SIZE);
 
 // The 16k + density-20 case is already reported by the compile_error
 // above; skip the generic assert there so it is not a second error.
-#[cfg(all(
-    any(density = "18", density = "19", density = "20"),
-    not(all(boot_size = "16k", density = "20"))
-))]
+#[cfg(all(density_known, not(all(boot_size = "16k", density = "20"))))]
 const _: () = assert!(geometry::boot_size_valid(FLASH_SIZE, BOOT_SIZE));
 
 /// Fixed location of the boot-info block: the top page of the BOOT
@@ -170,7 +164,7 @@ const _: () = assert!(geometry::boot_size_valid(FLASH_SIZE, BOOT_SIZE));
 pub const BOOT_INFO_ADDR: usize = geometry::boot_info_addr(BOOT_SIZE);
 
 /// Lock-region bits covering both copies of BOOT; a caller clears these.
-#[cfg(any(density = "18", density = "19", density = "20"))]
+#[cfg(density_known)]
 pub const BOOT_REGIONS: u32 = geometry::boot_region_mask(FLASH_SIZE, BOOT_SIZE);
 
 /// Offset of the [`AppManifest`](crate::manifest::AppManifest) within the app

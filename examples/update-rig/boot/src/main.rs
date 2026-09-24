@@ -46,7 +46,7 @@ use hal::watchdog::{Watchdog, WatchdogTimeout};
 use proto::{Decoder, Feed, Message, Status};
 use rtt_target::rprintln;
 use samd5_boot::{
-    Boot, BootConfig, FlashError, InstallError, Unverified,
+    Aborted, Boot, BootConfig, FlashError, InstallError, Unverified,
     boot_info::{self, BootInfo},
     consts, install_boot_info,
     persist::{BkupRamStore, BootStorage},
@@ -124,14 +124,16 @@ fn main() -> ! {
     // SAFETY: nothing else in this rig uses the base of backup RAM.
     let mut store = unsafe { BkupRamStore::<{ link::STORE_OFFSET }>::new() };
 
-    // The receive interrupt must not outlive this image: past this call the
-    // core may be running the application, vectoring through its table.
-    serial.quiesce();
-    let mut boot = boot.boot_or_enter_download(&mut store);
-    serial.arm();
-
-    rprintln!("boot: waiting for an image (no deadline)");
+    let mut boot = boot;
     loop {
+        // The receive interrupt must not outlive this image: past this call
+        // the core may be running the application, vectoring through its
+        // table.
+        serial.quiesce();
+        boot = boot.boot_or_enter_download(&mut store);
+        serial.arm();
+
+        rprintln!("boot: waiting for an image (no deadline)");
         let len = listen(&mut serial, &mut decoder);
         boot = install(boot, &mut store, &mut serial, &mut clock, len);
         // The device should go back into service rather than sit here: a
@@ -144,9 +146,6 @@ fn main() -> ! {
         // which over RTT is the very buffer holding it. A lost report reads
         // to the host exactly like a successful install.
         handover(&mut serial, &mut clock);
-        serial.quiesce();
-        boot = boot.boot_or_enter_download(&mut store);
-        serial.arm();
     }
 }
 
@@ -161,13 +160,11 @@ fn listen(serial: &mut Link, decoder: &mut Decoder) -> u32 {
         // a BeginUpdate) is still in the SERCOM for `ImageStream`.
         if let Some(b) = serial.try_read_byte() {
             match decoder.feed(&[b]) {
-                Feed::Frame { msg, .. } => {
-                    match msg {
-                        Message::BeginUpdate { len } => return len,
-                        Message::Ping(payload) => send(serial, &Message::Pong(payload)),
-                        _ => rprintln!("boot: ignoring host-bound message"),
-                    }
-                }
+                Feed::Frame { msg, .. } => match msg {
+                    Message::BeginUpdate { len } => return len,
+                    Message::Ping(payload) => send(serial, &Message::Pong(payload)),
+                    _ => rprintln!("boot: ignoring a message that is not for BOOT"),
+                },
                 Feed::DeserError { .. } | Feed::Overfull { .. } => rprintln!("boot: bad frame"),
                 Feed::Consumed => (),
             }
@@ -212,16 +209,15 @@ fn install(
         clock,
         left: len,
     };
-    let (err, boot) = boot.install(store, record, source);
+    let Aborted { error, boot } = boot.install(store, record, source);
 
     if serial.take_rx_error() {
         rprintln!("boot: receive error during the image body (overrun?)");
     }
-    let status = match err {
+    let status = match error {
         InstallError::Flash(FlashError::ImageTooLarge) => Status::TooLarge,
         InstallError::Flash(FlashError::Nvm(_)) => Status::FlashError,
         InstallError::Verify(_) => Status::VerifyFailed,
-        // A store write failure is reported as a flash error.
         InstallError::Write(_) => Status::FlashError,
     };
     rprintln!("boot: install failed: {:?}", status);
@@ -265,9 +261,7 @@ fn send(serial: &mut Link, msg: &Message) {
     // MAX_FRAME is sized for the largest Message, so this cannot fail.
     if let Ok(frame) = proto::encode(msg, &mut buf) {
         serial.write_all(frame);
-        // A board that ties the transceiver's /RE to the driver enable
-        // echoes this node's own burst back; drop it before it is taken
-        // for the head of the host's next frame.
+        // Drops this node's own echo off the half-duplex bus, not host traffic.
         serial.flush_rx();
     }
 }

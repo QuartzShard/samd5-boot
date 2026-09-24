@@ -2,7 +2,16 @@
 name = "samd5-boot"
 version = "0.1.0"
 edition = "2024"
+# The floor, not a recommendation: let-chains under edition 2024 and
+# `slice::as_chunks` both landed in 1.88, and nothing here needs more. Firmware
+# work pins toolchains for reproducible builds, so a higher floor would lock
+# out this crate's own audience for no gain.
+rust-version = "1.88"
 license = "MPL-2.0"
+description = "A bank-swapping A:B bootloader for ATSAMD/E5x microcontrollers."
+repository = "https://github.com/QuartzShard/samd5-boot"
+keywords = ["bootloader", "firmware-update", "ota", "samd51", "cortex-m"]
+categories = ["embedded", "no-std", "hardware-support"]
 exclude = ["xtask", "examples", "scripts"]
 
 [dependencies]
@@ -21,9 +30,13 @@ embedded-hal-02 = { package = "embedded-hal", version = "0.2.7", optional = true
 # carries -rt and the critical-section impl itself; this crate has neither.
 
 [features]
-default = ["target"]
-# Everything that drives the silicon. Off, the crate is host-buildable and
-# exposes only the layouts and formulas the ABI is made of.
+# Nothing by default, so a plain dependency is the host-buildable flash ABI and
+# no driver: that is what host tooling wants, and it is the configuration
+# `cargo publish` verifies. Firmware picks a part instead, and a part brings
+# `target` with it, so a downstream binary never names both.
+default = []
+# Everything that drives the silicon. Off, the crate exposes only the layouts
+# and formulas the ABI is made of.
 target = ["dep:atsamd-hal", "dep:cortex-m", "dep:embedded-hal-02"]
 
 # Chip selection: enable exactly one part feature.
@@ -45,51 +58,51 @@ bootprot-64k = []
 bootprot-96k = []
 
 # SAMD51G (48-pin)
-samd51g18a = ["atsamd-hal?/samd51g"]
-samd51g19a = ["atsamd-hal?/samd51g"]
+samd51g18a = ["target", "atsamd-hal/samd51g"]
+samd51g19a = ["target", "atsamd-hal/samd51g"]
 
 # SAMD51J (64-pin)
-samd51j18a = ["atsamd-hal?/samd51j"]
-samd51j19a = ["atsamd-hal?/samd51j"]
-samd51j20a = ["atsamd-hal?/samd51j"]
+samd51j18a = ["target", "atsamd-hal/samd51j"]
+samd51j19a = ["target", "atsamd-hal/samd51j"]
+samd51j20a = ["target", "atsamd-hal/samd51j"]
 
 # SAMD51N (100-pin)
-samd51n19a = ["atsamd-hal?/samd51n"]
-samd51n20a = ["atsamd-hal?/samd51n"]
+samd51n19a = ["target", "atsamd-hal/samd51n"]
+samd51n20a = ["target", "atsamd-hal/samd51n"]
 
 # SAMD51P (120/128-pin)
-samd51p19a = ["atsamd-hal?/samd51p"]
-samd51p20a = ["atsamd-hal?/samd51p"]
+samd51p19a = ["target", "atsamd-hal/samd51p"]
+samd51p20a = ["target", "atsamd-hal/samd51p"]
 
 # SAME51G (48-pin)
-same51g18a = ["atsamd-hal?/same51g"]
-same51g19a = ["atsamd-hal?/same51g"]
+same51g18a = ["target", "atsamd-hal/same51g"]
+same51g19a = ["target", "atsamd-hal/same51g"]
 
 # SAME51J (64-pin)
-same51j18a = ["atsamd-hal?/same51j"]
-same51j19a = ["atsamd-hal?/same51j"]
-same51j20a = ["atsamd-hal?/same51j"]
+same51j18a = ["target", "atsamd-hal/same51j"]
+same51j19a = ["target", "atsamd-hal/same51j"]
+same51j20a = ["target", "atsamd-hal/same51j"]
 
 # SAME51N (100-pin)
-same51n19a = ["atsamd-hal?/same51n"]
-same51n20a = ["atsamd-hal?/same51n"]
+same51n19a = ["target", "atsamd-hal/same51n"]
+same51n20a = ["target", "atsamd-hal/same51n"]
 
 # SAME53J (64-pin)
-same53j18a = ["atsamd-hal?/same53j"]
-same53j19a = ["atsamd-hal?/same53j"]
-same53j20a = ["atsamd-hal?/same53j"]
+same53j18a = ["target", "atsamd-hal/same53j"]
+same53j19a = ["target", "atsamd-hal/same53j"]
+same53j20a = ["target", "atsamd-hal/same53j"]
 
 # SAME53N (100-pin)
-same53n19a = ["atsamd-hal?/same53n"]
-same53n20a = ["atsamd-hal?/same53n"]
+same53n19a = ["target", "atsamd-hal/same53n"]
+same53n20a = ["target", "atsamd-hal/same53n"]
 
 # SAME54N (100-pin)
-same54n19a = ["atsamd-hal?/same54n"]
-same54n20a = ["atsamd-hal?/same54n"]
+same54n19a = ["target", "atsamd-hal/same54n"]
+same54n20a = ["target", "atsamd-hal/same54n"]
 
 # SAME54P (120/128-pin)
-same54p19a = ["atsamd-hal?/same54p"]
-same54p20a = ["atsamd-hal?/same54p"]
+same54p19a = ["target", "atsamd-hal/same54p"]
+same54p20a = ["target", "atsamd-hal/same54p"]
 
 [package.metadata.docs.rs]
 features = ["samd51j20a"]

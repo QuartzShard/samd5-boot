@@ -12,7 +12,7 @@ use hal::{
     watchdog::{Watchdog, WatchdogTimeout},
 };
 
-use crate::persist::{BootStorage, UpdateMailbox};
+use crate::persist::{BootStorage, RevertReason, UpdateMailbox};
 
 /// What [`BootClient::confirm`] did with the watchdog.
 pub enum WdtHandoff {
@@ -24,11 +24,19 @@ pub enum WdtHandoff {
     LockedByAlwaysOn,
 }
 
+/// Failure of a mailbox update, which reads the record before writing the
+/// amended one back.
+pub enum ClientError<R, W> {
+    Read(R),
+    Write(W),
+}
+
 /// The previous boot's outcome, for upstream reporting.
 pub struct BootOutcome {
-    /// Nonzero if the bootloader reverted an image on the way here; the
-    /// value is a [`reason`](crate::persist::reason) code.
-    pub revert_reason: u8,
+    /// Why the bootloader reverted an image on the way here, if it did.
+    /// `None` is also what an unrecognised code reads as, which is what a
+    /// record written by a newer BOOT looks like.
+    pub revert_reason: Option<RevertReason>,
 }
 
 /// The application-side handle over the shared [`BootStorage`]: the
@@ -49,17 +57,20 @@ impl<St: BootStorage> BootClient<St> {
         self.store
     }
 
-    fn set_flag(&mut self, f: impl FnOnce(&mut UpdateMailbox)) -> Result<(), St::WriteErr> {
-        let mut record = self.store.read().unwrap_or_default();
+    fn set_flag(
+        &mut self,
+        f: impl FnOnce(&mut UpdateMailbox),
+    ) -> Result<(), ClientError<St::ReadErr, St::WriteErr>> {
+        let mut record = self.store.read().map_err(ClientError::Read)?;
         f(&mut record.mailbox);
-        self.store.write(record)
+        self.store.write(record).map_err(ClientError::Write)
     }
 
     /// Read what the bootloader recorded on the way to this boot.
     pub fn boot_state(&mut self) -> Result<BootOutcome, St::ReadErr> {
         let record = self.store.read()?;
         Ok(BootOutcome {
-            revert_reason: record.boot_state.revert_reason,
+            revert_reason: record.boot_state.reason(),
         })
     }
 
@@ -74,7 +85,7 @@ impl<St: BootStorage> BootClient<St> {
         &mut self,
         wdt: &mut Watchdog,
         cfg: Option<WatchdogTimeout>,
-    ) -> Result<WdtHandoff, St::WriteErr> {
+    ) -> Result<WdtHandoff, ClientError<St::ReadErr, St::WriteErr>> {
         wdt.feed();
 
         self.set_flag(|mailbox| mailbox.set_confirmed(true))?;
@@ -97,12 +108,12 @@ impl<St: BootStorage> BootClient<St> {
     /// boot. Safe to call from a panic handler as a fast path to revert;
     /// if the write cannot land, the trial watchdog and attempt counter
     /// remain the backstop.
-    pub fn reject(&mut self) -> Result<(), St::WriteErr> {
+    pub fn reject(&mut self) -> Result<(), ClientError<St::ReadErr, St::WriteErr>> {
         self.set_flag(|mailbox| mailbox.set_rejected(true))
     }
 
     /// Ask the bootloader to enter download mode on the next boot.
-    pub fn request_update(&mut self) -> Result<(), St::WriteErr> {
+    pub fn request_update(&mut self) -> Result<(), ClientError<St::ReadErr, St::WriteErr>> {
         self.set_flag(|mailbox| mailbox.set_request_update(true))
     }
 }

@@ -37,12 +37,10 @@
 //! could drive it itself (DS 34.6.3.6: `CTRLA.FORM` = 0x0 with
 //! `CTRLA.TXPO` = 0x3 puts the part in RS485 mode, holds TE through the stop
 //! bits, and adds `CTRLC.GTIME` guard time). This crate drives PB00 by hand
-//! instead: it keeps the SERCOM on the well-trodden `TXPO` = 0x0 setting, lets
-//! the firmware scope or force the driver-enable line directly while bringing
-//! the rig up, and leaves a working UART if the RS485 path misbehaves.
-//! Switching to hardware TE is a three-line change: `txpo_3()` instead of
-//! `txpo_0()`, PB00 into `AlternateD`, and drop the TE handling from
-//! [`Serial::write_all`].
+//! instead, which leaves the SERCOM on `TXPO` = 0x0 and the link usable as a
+//! plain UART. Switching to hardware TE is a three-line change: `txpo_3()`
+//! instead of `txpo_0()`, PB00 into `AlternateD`, and drop the TE handling
+//! from [`Serial::write_all`].
 //!
 //! The part that has to be right either way is the release edge.
 //! [`Serial::write_all`] waits on `INTFLAG.TXC`, which sets only once the
@@ -351,10 +349,10 @@ impl Serial {
 
     /// Discard everything buffered on the receive side.
     ///
-    /// Worth calling after [`write_all`](Self::write_all) on a board that ties
-    /// the transceiver's receiver-enable to PB00: the receiver output goes
-    /// high impedance while this node drives, and the floating input can fake
-    /// a start bit.
+    /// Worth calling after [`write_all`](Self::write_all): a board that leaves
+    /// the transceiver's receiver enabled hears this node's own burst, and one
+    /// that ties receiver-enable to PB00 instead floats the receiver output
+    /// while this node drives, which can fake a start bit.
     pub fn flush_rx(&mut self) {
         while self.try_read_byte().is_some() {}
     }

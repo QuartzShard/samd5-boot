@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use samd5_boot::manifest;
+use samd5_boot_tools::image::stamp;
 
 const TRIPLE: &str = "thumbv7em-none-eabihf";
 
@@ -86,12 +86,15 @@ pub fn build_demo(transport: Transport) -> Result<Artifacts> {
     println!("[1/3] app (confirming build)");
     cargo(&demo.join("app"), &transport.args(&[]))?;
     let app_raw = objcopy(&demo.join("app"), "app", &demo.join("app-raw.bin"))?;
-    stamp(&app_raw, &out.app, APP_VERSION)?;
+    report(stamp(&app_raw, &out.app, APP_VERSION)?, &out.app);
 
     println!("[2/3] app (no-confirm build)");
     cargo(&demo.join("app"), &transport.args(&["noconfirm"]))?;
     let nc_raw = objcopy(&demo.join("app"), "app", &demo.join("app-nc-raw.bin"))?;
-    stamp(&nc_raw, &out.app_noconfirm, APP_NOCONFIRM_VERSION)?;
+    report(
+        stamp(&nc_raw, &out.app_noconfirm, APP_NOCONFIRM_VERSION)?,
+        &out.app_noconfirm,
+    );
 
     println!("[3/3] boot");
     cargo(&demo.join("boot"), &transport.args(&[]))?;
@@ -101,35 +104,6 @@ pub fn build_demo(transport: Transport) -> Result<Artifacts> {
 }
 
 /// Stamp a linked image so BOOT will verify it, reporting what went in.
-pub fn stamp(input: &Path, output: &Path, version: u16) -> Result<PathBuf> {
-    let mut image = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    // `crc32_image` runs to `image_len`, and the DSU walks whole words.
-    while !image.len().is_multiple_of(4) {
-        image.push(0xFF);
-    }
-    let stamped = match manifest::stamp(&mut image, version) {
-        Ok(s) => s,
-        Err(manifest::StampError::TooShort { len, need }) => bail!(
-            "{} is {len} bytes; a manifest needs at least {need}. Is the manifest slot \
-             reserved (install_manifest! plus samd5_boot_app.x)?",
-            input.display()
-        ),
-        Err(manifest::StampError::Unaligned { len }) => {
-            bail!("{} is {len} bytes, which is not a whole number of words", input.display())
-        }
-    };
-    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
-    println!(
-        "  stamped {} ({} bytes): version={} crc32_vec_table={:#010x} crc32_image={:#010x}",
-        output.display(),
-        stamped.image_len,
-        stamped.version,
-        stamped.crc32_vec_table,
-        stamped.crc32_image
-    );
-    Ok(output.to_path_buf())
-}
-
 /// Flip a byte in the middle of the body: past the vector table, inside
 /// the range the device's CRC covers. Returns the offset it flipped.
 pub fn corrupt_body(image: &mut [u8]) -> usize {
@@ -166,4 +140,15 @@ fn objcopy(crate_dir: &Path, bin: &str, out: &Path) -> Result<PathBuf> {
         bail!("{tool} failed on {}", elf.display());
     }
     Ok(out.to_path_buf())
+}
+
+fn report(stamped: samd5_boot::manifest::Stamped, path: &Path) {
+    println!(
+        "  stamped {} ({} bytes): version={} crc32_vec_table={:#010x} crc32_image={:#010x}",
+        path.display(),
+        stamped.image_len,
+        stamped.version,
+        stamped.crc32_vec_table,
+        stamped.crc32_image
+    );
 }

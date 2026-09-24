@@ -1,0 +1,41 @@
+[package]
+name = "samd5-boot-tools"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MPL-2.0"
+description = "Bench tooling for samd5-boot: fuse provisioning, bootloader flashing and image stamping for ATSAMD/E5x parts."
+repository = "https://github.com/QuartzShard/samd5-boot"
+keywords = ["bootloader", "firmware-update", "probe-rs", "samd51", "cortex-m"]
+categories = ["embedded", "development-tools", "command-line-utilities"]
+readme = "README.md"
+
+# Standalone workspace, like every other crate in this repository.
+[workspace]
+
+[lib]
+name = "samd5_boot_tools"
+
+[[bin]]
+name = "samd5-boot-tools"
+path = "src/bin/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The command line front end. Off, this is a library for a project's own
+# xtask to call, which is the form that composes with an existing build.
+cli = ["dep:clap"]
+
+[dependencies]
+anyhow = "1"
+bytemuck = "1.25.2"
+clap = { version = "4", features = ["derive"], optional = true }
+# Caret, not an exact pin: a library that pinned probe-rs would force that
+# exact version on any consumer who also depends on it, and a mismatch is a
+# hard conflict. 0.30 is what this has been tested against on silicon.
+probe-rs = "0.30"
+# The flash ABI, from the crate that defines it: manifest layout, CRC
+# convention and fuse encodings all come from there rather than being
+# restated, so tooling and firmware cannot drift apart.
+samd5-boot = { version = "0.1", path = "..", default-features = false }

@@ -74,20 +74,13 @@ impl<T: Transport> Link<T> {
         self.transport.clear_input()
     }
 
-    /// Pick the link back up after a reset, discarding anything half-decoded
-    /// from before it.
-    pub fn reconnect(&mut self) -> Result<()> {
-        self.pending.clear();
-        self.decoder = proto::Decoder::new();
-        self.transport.reconnect()
-    }
-
-    /// Reconnect, then drop anything the device said before now.
+    /// Pick the link back up after a reset: reconnect, then drop anything
+    /// the device said before now, including anything half-decoded.
     ///
     /// A failed reconnect is not itself an error here: the decoder reset
     /// still has to happen, and the device is most likely only mid-reset.
     pub fn resync(&mut self) -> Result<()> {
-        let _ = self.reconnect();
+        let _ = self.transport.reconnect();
         self.flush_input()
     }
 

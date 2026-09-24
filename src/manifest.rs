@@ -233,9 +233,10 @@ pub fn read_version(image: &[u8]) -> Option<u16> {
     if image.len() < MIN_IMAGE_LEN {
         return None;
     }
-    let magic = read_u32(image, OFF_MAGIC);
-    let fmt = read_u16(image, OFF_FMT_VERSION);
-    (magic == MAGIC && fmt >= FMT_VER).then(|| read_u16(image, OFF_VERSION))
+    let manifest: AppManifest =
+        bytemuck::pod_read_unaligned(&image[MANIFEST_OFFSET..][..size_of::<AppManifest>()]);
+    (manifest.body.magic == MAGIC && manifest.body.fmt_version >= FMT_VER)
+        .then_some(manifest.body.version)
 }
 
 fn write_u16(buf: &mut [u8], off: usize, v: u16) {
@@ -246,13 +247,6 @@ fn write_u32(buf: &mut [u8], off: usize, v: u32) {
 }
 fn write_u64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-fn read_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
-}
-fn read_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
 
 #[cfg(test)]

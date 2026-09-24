@@ -24,14 +24,14 @@
 #![no_main]
 
 use atsamd_hal as hal;
+use hal::watchdog::{Watchdog, WatchdogTimeout};
 use proto::{Decoder, Feed, MAX_FRAME, Message, encode};
 use rtt_target::rprintln;
-use hal::watchdog::{Watchdog, WatchdogTimeout};
 use samd5_boot::{
     client::BootClient,
     install_manifest,
     manifest::AppManifest,
-    persist::BkupRamStore,
+    persist::{BkupRamStore, RevertReason},
 };
 
 /// Identifies this build on the wire, so the host can tell which image a
@@ -84,8 +84,13 @@ fn main() -> ! {
 
     // SAFETY: the same backup-RAM record BOOT keeps, at the same offset.
     let mut client = BootClient::new(unsafe { BkupRamStore::<{ link::STORE_OFFSET }>::new() });
-    let revert_reason = client.boot_state().ok().map_or(0, |s| s.revert_reason);
-    if revert_reason != 0 {
+    // An unreadable store and a code this build cannot decode both report
+    // here as no revert.
+    let reason = client
+        .boot_state()
+        .map_or(RevertReason::None, |s| s.revert_reason.unwrap_or_default());
+    let revert_reason = reason as u8;
+    if reason != RevertReason::None {
         rprintln!("app: previous image was rolled back, reason {}", revert_reason);
     }
 
@@ -153,10 +158,10 @@ fn main() -> ! {
 
 fn send(serial: &mut Link, msg: &Message) {
     let mut buf = [0u8; MAX_FRAME];
+    // MAX_FRAME is sized for the largest Message, so this cannot fail.
     if let Ok(frame) = encode(msg, &mut buf) {
         serial.write_all(frame);
-        // A transceiver whose receiver stays enabled hears this node's own
-        // burst; drop it before it reaches the decoder.
+        // Drops this node's own echo off the half-duplex bus, not host traffic.
         serial.flush_rx();
     }
 }

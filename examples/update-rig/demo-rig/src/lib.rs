@@ -33,9 +33,6 @@ pub const CORE_CLOCK_HZ: u32 = 48_000_000;
 ///
 /// Layout is [`RTT_POINTER_MAGIC`] then the address, both little-endian.
 /// The magic is written last, so a half-written slot is not trusted.
-pub const RTT_POINTER_OFFSET: usize = size_of::<BootStore>();
+pub const RTT_POINTER_OFFSET: usize = STORE_OFFSET + size_of::<BootStore>();
 pub const RTT_POINTER_ADDR: usize = BKUPRAM_ADDR + RTT_POINTER_OFFSET;
 pub const RTT_POINTER_MAGIC: u32 = 0x7274_7470;
-
-// The record and the pointer slot share backup RAM and must not overlap.
-const _: () = assert!(RTT_POINTER_OFFSET >= STORE_OFFSET + size_of::<BootStore>());

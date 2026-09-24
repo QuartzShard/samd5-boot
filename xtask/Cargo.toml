@@ -11,9 +11,13 @@ publish = false
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# Pinned exactly: probe-rs is pre-1.0 and its API moves between minor
-# versions. This is the release that has been driving this hardware, so a
-# bump is a deliberate step with a bench run behind it, not a caret.
+# The device operations, from the crate that publishes them: provisioning,
+# the two-head flash and image stamping are not rig-specific and have no
+# business being duplicated here. What stays in this crate is the demo rig:
+# building its images, its wire protocol, and the self-test.
+samd5-boot-tools = { path = "../samd5-boot-tools", default-features = false }
+# Pinned exactly here, where nothing downstream can conflict with it: the
+# self-test drives RTT directly and probe-rs moves between minor versions.
 probe-rs = "=0.30.0"
 # The flash ABI, from the crate that defines it: manifest layout, CRC
 # convention and fuse encodings all come from here rather than being

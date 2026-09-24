@@ -5,7 +5,7 @@
 //! the fuse encodings (`samd5-boot` with `--no-default-features`), so there
 //! is no second implementation of a CRC range or a BOOTPROT value to drift.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -13,15 +13,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use proto::{Message, Status};
 
-mod flash;
 mod image;
 mod link;
-mod probe;
-mod provision;
 mod selftest;
 
 use link::{Link, Transport, rtt::RttLink, serial::Serial};
-use probe::Mode;
+use samd5_boot_tools::{Mode, flash, image as tools_image, provision};
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "samd5-boot bench tooling", version)]
@@ -193,7 +190,7 @@ fn run() -> Result<()> {
             output,
             version,
         } => {
-            image::stamp(&input, &output, version)?;
+            tools_image::stamp(&input, &output, version)?;
             Ok(())
         }
 
@@ -208,12 +205,15 @@ fn run() -> Result<()> {
             dry_run,
         } => provision::run(
             &chip,
-            provision::Request {
-                boot_size,
-                lock_boot: !no_lock,
-                see_sblk: sblk,
-                restore,
+            match restore {
+                Some(path) => provision::Request::Restore(path),
+                None => provision::Request::Fuses(provision::Fuses {
+                    boot_size,
+                    lock_boot: !no_lock,
+                    see_sblk: sblk,
+                }),
             },
+            &image::repo_root(),
             mode(dry_run),
         ),
 
@@ -221,7 +221,7 @@ fn run() -> Result<()> {
             chip,
             store_offset,
             dry_run,
-        } => provision::request_update(&chip, store_offset, mode(dry_run)),
+        } => provision::request_update(&chip, record_addr(store_offset), mode(dry_run)),
 
         Cmd::Flash {
             chip,
@@ -264,6 +264,11 @@ fn open_link(chip: &str, port: Option<&str>, log: bool) -> Result<Link<Box<dyn T
     let link = Link::new(transport);
     eprintln!("link: {}", link.describe());
     Ok(link)
+}
+
+/// Where the rig's firmware keeps its boot record.
+fn record_addr(store_offset: usize) -> u64 {
+    (samd5_boot::consts::BKUPRAM_ADDR + store_offset) as u64
 }
 
 fn mode(dry_run: bool) -> Mode {
@@ -324,34 +329,8 @@ fn link_op(link: &mut Link<Box<dyn Transport>>, op: LinkOp) -> Result<()> {
             }
         }
 
-        LinkOp::Update { ref image } | LinkOp::Bogus { ref image } => {
-            let corrupt = matches!(op, LinkOp::Bogus { .. });
-            let mut bytes =
-                std::fs::read(image).with_context(|| format!("reading {}", image.display()))?;
-            if corrupt {
-                let at = image::corrupt_body(&mut bytes);
-                println!("corrupted byte {at} of {}", bytes.len());
-            }
-            let len: u32 = bytes.len().try_into().context("image exceeds 4 GiB")?;
-            request(link, &Message::BeginUpdate { len })?;
-            let started = Instant::now();
-            link.write_raw(&bytes)?;
-            println!("   {len} bytes sent in {:.1}s", started.elapsed().as_secs_f32());
-            match link.recv(Instant::now() + Duration::from_secs(60))? {
-                Some(Message::UpdateResult(status)) => {
-                    println!("<- UpdateResult({status:?})");
-                    match status {
-                        Status::Ok => Ok(()),
-                        other => bail!("device rejected the image: {other:?}"),
-                    }
-                }
-                Some(other) => bail!("unexpected {other:?}"),
-                None => {
-                    println!("no reply: the device swapped and rebooted (install succeeded)");
-                    Ok(())
-                }
-            }
-        }
+        LinkOp::Update { image } => send_image(link, &image, Body::AsBuilt),
+        LinkOp::Bogus { image } => send_image(link, &image, Body::Corrupted),
 
         LinkOp::Reboot => {
             request(link, &Message::Update)?;
@@ -366,6 +345,40 @@ fn link_op(link: &mut Link<Box<dyn Transport>>, op: LinkOp) -> Result<()> {
         LinkOp::Reject => {
             request(link, &Message::Reject)?;
             println!("-> Reject (application condemns itself and resets)");
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Body {
+    AsBuilt,
+    Corrupted,
+}
+
+fn send_image(link: &mut Link<Box<dyn Transport>>, image: &Path, body: Body) -> Result<()> {
+    let mut bytes =
+        std::fs::read(image).with_context(|| format!("reading {}", image.display()))?;
+    if body == Body::Corrupted {
+        let at = image::corrupt_body(&mut bytes);
+        println!("corrupted byte {at} of {}", bytes.len());
+    }
+    let len: u32 = bytes.len().try_into().context("image exceeds 4 GiB")?;
+    request(link, &Message::BeginUpdate { len })?;
+    let started = Instant::now();
+    link.write_raw(&bytes)?;
+    println!("   {len} bytes sent in {:.1}s", started.elapsed().as_secs_f32());
+    match link.recv(Instant::now() + Duration::from_secs(60))? {
+        Some(Message::UpdateResult(status)) => {
+            println!("<- UpdateResult({status:?})");
+            match status {
+                Status::Ok => Ok(()),
+                other => bail!("device rejected the image: {other:?}"),
+            }
+        }
+        Some(other) => bail!("unexpected {other:?}"),
+        None => {
+            println!("no reply: the device swapped and rebooted (install succeeded)");
             Ok(())
         }
     }
@@ -393,7 +406,7 @@ fn live_link(chip: &str, port: Option<&str>, log: bool) -> Result<Link<Box<dyn T
     println!("nothing answered on the link; asking BOOT to wait, through the debugger");
     // RTT holds the probe and `request_update` needs it: the link above is a
     // match binding, so it has already dropped by here.
-    provision::request_update(chip, demo_rig::STORE_OFFSET, Mode::Run)?;
+    provision::request_update(chip, record_addr(demo_rig::STORE_OFFSET), Mode::Run)?;
     open_link(chip, port, log)
 }
 

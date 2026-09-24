@@ -21,7 +21,7 @@ use crate::{
     },
     flash_writer::{self, FlashError},
     manifest::{self, AppManifest},
-    persist::{BankState, BootStorage, BootStore, reason},
+    persist::{BankState, BootStorage, BootStore, RevertReason},
 };
 
 /// Live SEESTAT, not the fuse: the reserve the hardware is operating
@@ -121,17 +121,25 @@ impl<W> From<DownloadError> for InstallError<W> {
     }
 }
 
+/// A verb that could not complete, handing the [`Boot`] it consumed back so
+/// the caller can take another route with the peripherals. Dropping one
+/// drops the NVM, DSU and watchdog with it, which is why it is `must_use`.
+#[must_use]
+pub struct Aborted<E, B> {
+    pub error: E,
+    pub boot: B,
+}
+
 /// What the stored boot record says this boot should do. Read with
 /// [`Boot::disposition`]; the caller runs the action each variant calls
 /// for, so its own validation or bookkeeping can sit in each arm.
 pub enum Disposition {
     SteadyBoot,
-    /// `attempt` is this boot's 1-based trial count; `exhausted` is set once it
-    /// has reached `max_boot_attempts`, meaning revert rather than try again.
-    Trial {
-        attempt: u8,
-        exhausted: bool,
-    },
+    /// `attempt` is this boot's 1-based trial count.
+    Trial { attempt: u8 },
+    /// The trial budget is spent: revert rather than boot again. `attempt`
+    /// is this boot's 1-based count.
+    TrialExhausted { attempt: u8 },
     Promote,
     Reject,
     ResumeInstall,
@@ -197,9 +205,12 @@ impl<S: SlotState> Boot<S> {
         store: &mut St,
         mut record: BootStore,
         source: impl core::iter::Iterator<Item = u8>,
-    ) -> (InstallError<St::WriteErr>, Self) {
+    ) -> Aborted<InstallError<St::WriteErr>, Self> {
         if let Err(e) = self.download(source) {
-            return (e.into(), self);
+            return Aborted {
+                error: e.into(),
+                boot: self,
+            };
         }
         record.boot_state.mark_new(&self.inactive_bank());
         record.boot_state.boot_count = 0;
@@ -210,7 +221,10 @@ impl<S: SlotState> Boot<S> {
         record.mailbox.set_confirmed(false);
         record.mailbox.set_rejected(false);
         if let Err(e) = store.write(record) {
-            return (InstallError::Write(e), self);
+            return Aborted {
+                error: InstallError::Write(e),
+                boot: self,
+            };
         }
         self.swap_reboot()
     }
@@ -223,10 +237,10 @@ impl<S: SlotState> Boot<S> {
         self,
         store: &mut St,
         record: BootStore,
-        reason: u8,
+        reason: RevertReason,
     ) -> Self {
         if record.boot_state.bank(&self.inactive_bank()) == BankState::Valid {
-            return self.revert(store, record, reason).1;
+            return self.revert(store, record, reason).boot;
         }
         self
     }
@@ -238,14 +252,17 @@ impl<S: SlotState> Boot<S> {
         self,
         store: &mut St,
         mut record: BootStore,
-        reason: u8,
-    ) -> (St::WriteErr, Self) {
+        reason: RevertReason,
+    ) -> Aborted<St::WriteErr, Self> {
         record
             .boot_state
             .set_bank(&self.nvm.first_bank(), BankState::Invalid);
-        record.boot_state.revert_reason = reason;
+        record.boot_state.set_reason(reason);
         if let Err(e) = store.write(record) {
-            return (e, self);
+            return Aborted {
+                error: e,
+                boot: self,
+            };
         }
         self.swap_reboot()
     }
@@ -387,9 +404,10 @@ impl Boot<Unverified> {
             match active {
                 BankState::New => {
                     let attempt = record.boot_state.boot_count.saturating_add(1);
-                    Disposition::Trial {
-                        attempt,
-                        exhausted: attempt > self.config.max_boot_attempts,
+                    if attempt > self.config.max_boot_attempts {
+                        Disposition::TrialExhausted { attempt }
+                    } else {
+                        Disposition::Trial { attempt }
                     }
                 }
                 BankState::Valid | BankState::None => Disposition::SteadyBoot,
@@ -421,7 +439,7 @@ impl Boot<Unverified> {
                 // Clear the flag before reverting: an uncleared reject
                 // would condemn the bank we swap into as well.
                 record.mailbox.set_rejected(false);
-                self.revert(store, record, reason::APP_REJECTED).1
+                self.revert(store, record, RevertReason::AppRejected).boot
             }
             // Verified before the promotion is recorded, so an image that
             // cannot be booted is never written down as good.
@@ -433,36 +451,43 @@ impl Boot<Unverified> {
                     record.boot_state.boot_count = 0;
                     // A trial that succeeded supersedes whatever rollback
                     // came before it, so the reason has served its purpose.
-                    record.boot_state.revert_reason = reason::NONE;
+                    record.boot_state.set_reason(RevertReason::None);
                     record.mailbox.set_confirmed(false);
-                    verified.boot_recorded(store, record).1.denounce()
+                    verified.boot_recorded(store, record).boot.denounce()
                 }
-                Err((_, boot)) => boot.fall_back(store, record, reason::VERIFY_FAILED),
+                Err(Aborted { boot, .. }) => {
+                    boot.fall_back(store, record, RevertReason::VerifyFailed)
+                }
             },
             Disposition::SteadyBoot => match self.verify() {
                 Ok(verified) => verified.boot_active(),
-                Err((_, boot)) => boot.fall_back(store, record, reason::VERIFY_FAILED),
+                Err(Aborted { boot, .. }) => {
+                    boot.fall_back(store, record, RevertReason::VerifyFailed)
+                }
             },
-            Disposition::Trial { exhausted, .. } => {
-                if exhausted {
-                    return self.revert(store, record, reason::ATTEMPTS_EXHAUSTED).1;
-                }
-                match self.verify() {
-                    // The count must land before the image runs, or the
-                    // trial cannot be held to its budget. Dropping to
-                    // download is the terminal state for a store that
-                    // cannot be written: swapping away instead would leave
-                    // this bank inactive and still `New`, which the next
-                    // boot reads as an interrupted install and swaps back.
-                    Ok(verified) => verified.boot_trial(store, record).1.denounce(),
-                    Err((_, boot)) => boot.revert(store, record, reason::VERIFY_FAILED).1,
-                }
+            Disposition::TrialExhausted { .. } => {
+                self.revert(store, record, RevertReason::AttemptsExhausted).boot
             }
+            Disposition::Trial { .. } => match self.verify() {
+                // Dropping to download is the terminal state for a store
+                // that cannot be written: swapping away instead would
+                // leave this bank inactive and still `New`, which the next
+                // boot reads as an interrupted install and swaps back.
+                Ok(verified) => verified.boot_trial(store, record).boot.denounce(),
+                // Condemn rather than `fall_back`: with nothing bootable
+                // in the other bank `fall_back` returns here, leaving this
+                // bank `New` with its count unmoved (only `boot_trial`
+                // advances it), so every later reset re-runs the same
+                // failing trial.
+                Err(Aborted { boot, .. }) => {
+                    boot.revert(store, record, RevertReason::VerifyFailed).boot
+                }
+            },
         }
     }
 
     /// Verify integrity of the active slot, unlocking boot
-    pub fn verify(mut self) -> Result<Boot<Verified>, (VerifyError, Boot<Unverified>)> {
+    pub fn verify(mut self) -> Result<Boot<Verified>, Aborted<VerifyError, Boot<Unverified>>> {
         match self.check_slot(ACTIVE_SLOT_ADDR) {
             Ok(_) => Ok(Boot {
                 nvm: self.nvm,
@@ -471,13 +496,15 @@ impl Boot<Unverified> {
                 config: self.config,
                 _state: PhantomData,
             }),
-            Err(e) => Err((e, self)),
+            Err(e) => Err(Aborted {
+                error: e,
+                boot: self,
+            }),
         }
     }
 }
 
 impl Boot<Verified> {
-    /// Persist the incremented trial count, arm the watchdog, and jump.
     /// Commit `record`, then jump. Returns only if the write failed, with
     /// the proof intact so the caller can discard it: booting an image
     /// whose bookkeeping was lost leaves a trial that can never resolve,
@@ -486,9 +513,12 @@ impl Boot<Verified> {
         self,
         store: &mut St,
         record: BootStore,
-    ) -> (St::WriteErr, Self) {
+    ) -> Aborted<St::WriteErr, Self> {
         if let Err(e) = store.write(record) {
-            return (e, self);
+            return Aborted {
+                error: e,
+                boot: self,
+            };
         }
         self.boot_active()
     }
@@ -499,10 +529,13 @@ impl Boot<Verified> {
         mut self,
         store: &mut St,
         mut record: BootStore,
-    ) -> (St::WriteErr, Self) {
+    ) -> Aborted<St::WriteErr, Self> {
         record.boot_state.boot_count = record.boot_state.boot_count.saturating_add(1);
         if let Err(e) = store.write(record) {
-            return (e, self);
+            return Aborted {
+                error: e,
+                boot: self,
+            };
         }
         self.wdt.start(self.config.trial_timeout as u8);
         self.boot_active()

@@ -8,11 +8,12 @@
 use crate::consts;
 
 /// Compatibility block the BOOT binary embeds at [`consts::BOOT_INFO_ADDR`]
-/// for the application to audit at runtime. Check `magic` against [`MAGIC`]
-/// before trusting the rest. Layout is APPEND ONLY (like the manifest), so an
-/// older application still reads the fields it knows. `boot_size` is the
-/// `BOOT_SIZE` this BOOT was built with, which the app compares against its
-/// own; `build_id` identifies the exact BOOT build (e.g. a VCS/CI hash).
+/// for the application to audit at runtime. [`read`] hands back whatever is
+/// stored, so put it through [`BootInfo::validated`] before trusting the rest.
+/// Layout is APPEND ONLY (like the manifest), so an older application still
+/// reads the fields it knows. `boot_size` is the `BOOT_SIZE` this BOOT was
+/// built with, which the app compares against its own; `build_id` identifies
+/// the exact BOOT build (e.g. a VCS/CI hash).
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy)]
 #[repr(C)]
 pub struct BootInfo {
@@ -27,6 +28,18 @@ pub struct BootInfo {
 pub const MAGIC: u32 = 0xb007_1f0b;
 /// Current boot-info layout version ([`BootInfo::abi_version`]).
 pub const ABI_VERSION: u16 = 1;
+
+impl BootInfo {
+    /// The block as stored, or `None` if nothing populated it or it predates
+    /// this build's [`ABI_VERSION`].
+    pub const fn validated(self) -> Option<Self> {
+        if self.magic == MAGIC && self.abi_version >= ABI_VERSION {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
 
 // Must fit the page reserved for it at the top of the BOOT region.
 const _: () = assert!(size_of::<BootInfo>() <= consts::PAGE_SIZE);

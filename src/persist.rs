@@ -118,10 +118,21 @@ pub struct BootState {
     /// total, so decode is infallible. Upper bits reserved, preserved.
     states: u8,
     pub boot_count: u8,
-    /// Why the last trial reverted; 0 = none. Codes land with the
-    /// revert flow.
+    /// Read it typed with [`BootState::reason`].
     pub revert_reason: u8,
     reserved: u8,
+}
+
+impl BootState {
+    /// Typed view of [`revert_reason`](Self::revert_reason). `None` is a code
+    /// this build cannot decode, not [`RevertReason::None`].
+    pub const fn reason(&self) -> Option<RevertReason> {
+        RevertReason::from_u8(self.revert_reason)
+    }
+
+    pub fn set_reason(&mut self, reason: RevertReason) {
+        self.revert_reason = reason as u8;
+    }
 }
 
 /// Keyed by the hal's `PhysicalBank`, so these are the one part of the
@@ -166,6 +177,7 @@ impl BootState {
 /// bootable in steady state; `New` is an installed image on trial, counted
 /// against the attempt budget until confirmed; `Valid` is a confirmed image;
 /// `Invalid` is condemned and never re-trialed.
+#[repr(u8)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum BankState {
     #[default]
@@ -182,8 +194,7 @@ impl BankState {
             0 => Self::None,
             1 => Self::Valid,
             2 => Self::New,
-            3 => Self::Invalid,
-            _ => unreachable!(),
+            _ => Self::Invalid,
         }
     }
 }
@@ -251,12 +262,31 @@ impl UpdateMailbox {
     }
 }
 
-/// `revert_reason` codes
-pub mod reason {
-    pub const NONE: u8 = 0;
-    pub const ATTEMPTS_EXHAUSTED: u8 = 1;
-    pub const VERIFY_FAILED: u8 = 2;
-    pub const APP_REJECTED: u8 = 3;
+/// Why the bootloader last abandoned an image, the typed form of the raw
+/// [`BootState::revert_reason`] byte. `None` is the steady state: no
+/// rollback has happened, or a later trial superseded the one that did.
+#[repr(u8)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum RevertReason {
+    #[default]
+    None = 0,
+    AttemptsExhausted = 1,
+    VerifyFailed = 2,
+    AppRejected = 3,
+}
+
+impl RevertReason {
+    /// Decode a stored [`BootState::revert_reason`] byte. `None` is a code
+    /// this build does not know, which a newer BOOT may have written.
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::AttemptsExhausted),
+            2 => Some(Self::VerifyFailed),
+            3 => Some(Self::AppRejected),
+            _ => None,
+        }
+    }
 }
 
 /// [`BootStorage`] for targets without SmartEEPROM: reads zeroed books,
@@ -291,11 +321,6 @@ unsafe impl BootStorage for NoStore {
 /// outlive the fault it covers for. Without a spare, a primary whose writes
 /// fail while an image is on trial leaves the bootloader with nowhere to go,
 /// because installing a replacement needs a write too.
-///
-/// What a power cut costs: the spare goes, the primary is stale, and the
-/// part re-enters whatever the primary last recorded. If that was a trial,
-/// the trial runs again and the spare counts it again, so recovery is one
-/// re-trial per power cycle rather than a dead end.
 pub struct Fallback<P, S> {
     primary: P,
     spare: S,
@@ -511,22 +536,6 @@ unsafe impl<const OFFSET: usize> BootStorage for SmartEepromStore<OFFSET> {
 
 #[cfg(test)]
 mod tests {
-    use super::crc32;
-
-    /// Host tooling seals a record the target then validates, so this has to
-    /// stay byte-identical to the image convention [`crate::crc32`] pins.
-    #[test]
-    fn record_crc_matches_the_image_convention() {
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-        let record: [u8; 12] = [
-            0x02, 0x03, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
-        ];
-        assert_eq!(crc32(&record), crate::crc32::crc32(&record));
-    }
-}
-
-#[cfg(test)]
-mod fallback_tests {
     use super::*;
 
     /// A backend whose writes can be switched off, standing in for a store
@@ -568,6 +577,17 @@ mod fallback_tests {
         record
     }
 
+    /// Host tooling seals a record the target then validates, so this has to
+    /// stay byte-identical to the image convention [`crate::crc32`] pins.
+    #[test]
+    fn record_crc_matches_the_image_convention() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        let record: [u8; 12] = [
+            0x02, 0x03, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(crc32(&record), crate::crc32::crc32(&record));
+    }
+
     #[test]
     fn a_working_primary_keeps_the_spare_empty() {
         let mut store = Fallback::new(flaky(), flaky());
@@ -593,15 +613,11 @@ mod fallback_tests {
 
         assert_eq!(store.read().unwrap().boot_state.boot_count, 2);
         assert_eq!(
-            store.primary.held.boot_state.boot_count,
-            1,
+            store.primary.held.boot_state.boot_count, 1,
             "the primary is behind, which is why the spare wins"
         );
     }
 
-    /// The ordering that matters: clearing the spare after a successful
-    /// primary write would leave a reset believing a spare older than the
-    /// primary.
     #[test]
     fn a_recovered_primary_takes_the_record_back() {
         let mut store = Fallback::new(flaky(), flaky());
@@ -643,5 +659,37 @@ mod fallback_tests {
         store.primary.writable = false;
         store.spare.writable = false;
         assert!(store.write(counted(1)).is_err());
+    }
+
+    /// The codes are a stored format: an application reads them from a
+    /// record a bootloader wrote, possibly a different build of one.
+    #[test]
+    fn codes_are_pinned() {
+        assert_eq!(RevertReason::None as u8, 0);
+        assert_eq!(RevertReason::AttemptsExhausted as u8, 1);
+        assert_eq!(RevertReason::VerifyFailed as u8, 2);
+        assert_eq!(RevertReason::AppRejected as u8, 3);
+        assert_eq!(BankState::None as u8, 0);
+        assert_eq!(BankState::Valid as u8, 1);
+        assert_eq!(BankState::New as u8, 2);
+        assert_eq!(BankState::Invalid as u8, 3);
+    }
+
+    #[test]
+    fn a_code_this_build_does_not_know_decodes_to_nothing() {
+        for v in 0..=3u8 {
+            assert_eq!(RevertReason::from_u8(v).map(|r| r as u8), Some(v));
+        }
+        assert!(RevertReason::from_u8(4).is_none());
+        assert!(RevertReason::from_u8(0xFF).is_none());
+    }
+
+    #[test]
+    fn the_stored_byte_round_trips() {
+        let mut state = BootState::default();
+        assert_eq!(state.reason(), Some(RevertReason::None));
+        state.set_reason(RevertReason::AppRejected);
+        assert_eq!(state.revert_reason, 3);
+        assert_eq!(state.reason(), Some(RevertReason::AppRejected));
     }
 }

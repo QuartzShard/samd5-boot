@@ -20,12 +20,12 @@
 //! is saved to a backup file before the erase, and `--restore` writes one
 //! back verbatim.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use samd5_boot::consts::{USER_PAGE_ADDR, USER_PAGE_SIZE, WRITE_UNIT, geometry};
 
-use crate::probe::{Device, Mode, Nvm, cmd};
+use crate::probe::{Cmd, Device, Mode, Nvm};
 
 const PAGE_WORDS: usize = USER_PAGE_SIZE / 4;
 const QUAD_WORDS: usize = WRITE_UNIT / 4;
@@ -110,7 +110,7 @@ pub fn read_page(nvm: &mut Nvm<'_>) -> Result<UserPage> {
 fn write_page(nvm: &mut Nvm<'_>, page: &UserPage) -> Result<()> {
     nvm.uncached(|nvm| {
         nvm.set_addr(USER_PAGE_ADDR as u32)?;
-        nvm.command(cmd::EP)?;
+        nvm.command(Cmd::Ep)?;
 
         for quad in 0..USER_PAGE_SIZE / WRITE_UNIT {
             // The erase left every quad word at 0xFF, so one that is already
@@ -121,25 +121,29 @@ fn write_page(nvm: &mut Nvm<'_>, page: &UserPage) -> Result<()> {
                 continue;
             }
             let addr = (USER_PAGE_ADDR + quad * WRITE_UNIT) as u32;
-            nvm.command(cmd::PBC)?;
+            nvm.command(Cmd::Pbc)?;
             nvm.fill(addr, words)?;
             // Explicit, because a page-buffer write advances ADDR by itself
             // and WQW commits whatever ADDR points at.
             nvm.set_addr(addr)?;
-            nvm.command(cmd::WQW)?;
+            nvm.command(Cmd::Wqw)?;
         }
         Ok(())
     })
 }
 
-pub struct Request {
+pub struct Fuses {
     pub boot_size: usize,
     pub lock_boot: bool,
     pub see_sblk: Option<u8>,
-    pub restore: Option<PathBuf>,
 }
 
-pub fn run(chip: &str, req: Request, mode: Mode) -> Result<()> {
+pub enum Request {
+    Fuses(Fuses),
+    Restore(PathBuf),
+}
+
+pub fn run(chip: &str, req: Request, backup_dir: &Path, mode: Mode) -> Result<()> {
     let mut device = Device::attach(chip, mode)?;
     let mut nvm = device.halted()?;
 
@@ -158,8 +162,8 @@ pub fn run(chip: &str, req: Request, mode: Mode) -> Result<()> {
         );
     }
 
-    let after = match &req.restore {
-        Some(path) => {
+    let after = match &req {
+        Request::Restore(path) => {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let page = UserPage::from_bytes(&bytes)?;
@@ -172,7 +176,7 @@ pub fn run(chip: &str, req: Request, mode: Mode) -> Result<()> {
             );
             page
         }
-        None => plan(&before, &req, param.flash_size)?,
+        Request::Fuses(fuses) => plan(&before, fuses, param.flash_size)?,
     };
 
     if after == before {
@@ -180,30 +184,34 @@ pub fn run(chip: &str, req: Request, mode: Mode) -> Result<()> {
         return Ok(());
     }
 
-    let backup = if mode.writes() {
-        Some(save_backup(chip, &before)?)
-    } else {
-        None
-    };
-    println!("writing the user page");
-    let Some(backup) = backup else {
+    if !mode.writes() {
+        println!("writing the user page");
         write_page(&mut nvm, &after)?;
         println!("dry run: nothing was written");
         return Ok(());
-    };
+    }
+
+    let backup = save_backup(backup_dir, chip, &before)?;
+    println!("writing the user page");
     let outcome = write_page(&mut nvm, &after).and_then(|()| verify(&mut nvm, &after));
     if outcome.is_err() {
-        eprintln!(
-            "\nthe page was erased before this failed, so the part may now have no \
-             fuses. The previous contents are in {}; put them back with:\n  \
-             cargo xtask provision --chip {chip} --restore {}",
-            backup.display(),
-            backup.display()
-        );
+        match &backup {
+            Some(path) => eprintln!(
+                "\nthe page was erased before this failed, so the part may now have no \
+                 fuses. The previous contents are in {}; put them back with:\n  \
+                 cargo xtask provision --chip {chip} --restore {}",
+                path.display(),
+                path.display()
+            ),
+            None => eprintln!(
+                "\nthe page was erased before this failed, so the part may now have no \
+                 fuses. It was blank before this ran, so there is nothing to put back: \
+                 provision it again."
+            ),
+        }
     }
     outcome?;
 
-    let boot_regions = geometry::boot_region_mask(param.flash_size, req.boot_size);
     let status = nvm.status()?;
     let runlock = nvm.runlock()?;
     println!("after reset: {status}");
@@ -215,18 +223,23 @@ pub fn run(chip: &str, req: Request, mode: Mode) -> Result<()> {
             after.bootprot()
         );
     }
-    if req.restore.is_none() && req.lock_boot && runlock & boot_regions != 0 {
-        bail!(
-            "BOOT regions did not latch as locked: RUNLOCK {runlock:#010x} \
-             still has bits of {boot_regions:#010x} set"
-        );
+    if let Request::Fuses(fuses) = &req
+        && fuses.lock_boot
+    {
+        let boot_regions = geometry::boot_region_mask(param.flash_size, fuses.boot_size);
+        if runlock & boot_regions != 0 {
+            bail!(
+                "BOOT regions did not latch as locked: RUNLOCK {runlock:#010x} \
+                 still has bits of {boot_regions:#010x} set"
+            );
+        }
     }
     println!("provisioned and verified");
     Ok(())
 }
 
 /// What the requested options make of the page that is there now.
-fn plan(before: &UserPage, req: &Request, flash_size: usize) -> Result<UserPage> {
+fn plan(before: &UserPage, req: &Fuses, flash_size: usize) -> Result<UserPage> {
     if !geometry::boot_size_valid(flash_size, req.boot_size) {
         bail!(
             "a {} KiB BOOT is not usable on a {} KiB part: it must be a whole number of \
@@ -306,20 +319,23 @@ fn verify(nvm: &mut Nvm<'_>, want: &UserPage) -> Result<()> {
 
 /// Keep the pre-erase contents, once. A second failed run must not overwrite
 /// the good capture with the blank page the first one left behind.
-fn save_backup(chip: &str, page: &UserPage) -> Result<PathBuf> {
-    let path = crate::image::repo_root().join(format!("userpage-{chip}.bak"));
+///
+/// `None` means no file holds the previous contents, because a blank page has
+/// none worth keeping.
+fn save_backup(dir: &Path, chip: &str, page: &UserPage) -> Result<Option<PathBuf>> {
+    let path = dir.join(format!("userpage-{chip}.bak"));
     if path.exists() {
         println!("  keeping the existing backup at {}", path.display());
-        return Ok(path);
+        return Ok(Some(path));
     }
     if page.is_blank() {
         println!("  not backing up a blank page");
-        return Ok(path);
+        return Ok(None);
     }
     std::fs::write(&path, page.to_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     println!("  saved the current user page to {}", path.display());
-    Ok(path)
+    Ok(Some(path))
 }
 
 /// Read-only report, for finding out what a part is actually configured as
@@ -363,11 +379,10 @@ pub fn info(chip: &str) -> Result<()> {
 ///
 /// The record is read, amended and resealed rather than replaced, so the
 /// trial bookkeeping already in it survives.
-pub fn request_update(chip: &str, offset: usize, mode: Mode) -> Result<()> {
-    use samd5_boot::consts::BKUPRAM_ADDR;
+pub fn request_update(chip: &str, record_addr: u64, mode: Mode) -> Result<()> {
     use samd5_boot::persist::BootStore;
 
-    let addr = (BKUPRAM_ADDR + offset) as u64;
+    let addr = record_addr;
     let words = size_of::<BootStore>() / 4;
 
     let mut device = Device::attach(chip, mode)?;
@@ -401,12 +416,11 @@ pub fn request_update(chip: &str, offset: usize, mode: Mode) -> Result<()> {
         .map(|c| u32::from_le_bytes(*c))
         .collect();
 
-    if !mode.writes() {
-        println!("dry run: would write {patched:08x?} to {addr:#x}");
-        return Ok(());
-    }
     nvm.write_words(addr, &patched)?;
-    println!("update request set; resetting into BOOT");
+    println!(
+        "{} the update request; resetting into BOOT",
+        if mode.writes() { "set" } else { "would set" }
+    );
     nvm.reset()?;
     Ok(())
 }
