@@ -79,8 +79,8 @@ pub mod geometry {
         boot_size > 0
             && boot_size <= BOOTPROT_MAX
             && boot_size < bank_size(flash_size)
-            && boot_size % region == 0
-            && boot_size % BOOTPROT_GRANULE == 0
+            && boot_size.is_multiple_of(region)
+            && boot_size.is_multiple_of(BOOTPROT_GRANULE)
     }
 }
 

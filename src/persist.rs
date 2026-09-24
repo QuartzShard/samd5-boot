@@ -278,6 +278,72 @@ unsafe impl BootStorage for NoStore {
     }
 }
 
+/// A store that keeps tracking when its primary cannot be written.
+///
+/// Writes go to `primary`. One that fails goes to `spare` instead, which is
+/// then the authority until a primary write lands again or the spare itself
+/// is lost. Reads prefer the spare exactly when it holds a sealed record,
+/// which is the case where the primary is behind.
+///
+/// The spare this exists for is [`BkupRamStore`]: it survives every reset
+/// including the one `BKSWRST` performs, so a trial keeps counting and can
+/// still revert, and it does *not* survive loss of power, so it cannot
+/// outlive the fault it covers for. Without a spare, a primary whose writes
+/// fail while an image is on trial leaves the bootloader with nowhere to go,
+/// because installing a replacement needs a write too.
+///
+/// What a power cut costs: the spare goes, the primary is stale, and the
+/// part re-enters whatever the primary last recorded. If that was a trial,
+/// the trial runs again and the spare counts it again, so recovery is one
+/// re-trial per power cycle rather than a dead end.
+pub struct Fallback<P, S> {
+    primary: P,
+    spare: S,
+}
+
+impl<P, S> Fallback<P, S> {
+    pub const fn new(primary: P, spare: S) -> Self {
+        Self { primary, spare }
+    }
+
+    pub fn free(self) -> (P, S) {
+        (self.primary, self.spare)
+    }
+}
+
+// SAFETY: both backends carry the per-word atomicity contract, and a record
+// is only ever handed to one of them whole.
+unsafe impl<P: BootStorage, S: BootStorage> BootStorage for Fallback<P, S> {
+    type ReadErr = P::ReadErr;
+    /// The spare's, because a write is only lost when the spare loses it too.
+    type WriteErr = S::WriteErr;
+
+    fn read_raw(&mut self) -> Result<BootStore, Self::ReadErr> {
+        // A sealed spare means a primary write has failed since the last one
+        // that landed. Validating here picks the source; the `read` above
+        // validates again to decide whether to start from the fresh default,
+        // which is a different question about a record already chosen.
+        if let Ok(spare) = self.spare.read_raw()
+            && spare.validated().is_some()
+        {
+            return Ok(spare);
+        }
+        self.primary.read_raw()
+    }
+
+    fn write_raw(&mut self, val: BootStore) -> Result<(), Self::WriteErr> {
+        // Invalidate the spare first. Clearing it after a successful primary
+        // write leaves a window in which a reset finds a spare that is older
+        // than the primary and believes it. An unsealed record is what
+        // "nothing here" looks like, so the default does the clearing.
+        let _ = self.spare.write_raw(BootStore::default());
+        if self.primary.write_raw(val).is_ok() {
+            return Ok(());
+        }
+        self.spare.write_raw(val)
+    }
+}
+
 /// [`BootStorage`] in backup RAM.
 ///
 /// Backup RAM keeps its contents across any reset, including the one BKSWRST
@@ -456,5 +522,126 @@ mod tests {
             0x02, 0x03, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
         ];
         assert_eq!(crc32(&record), crate::crc32::crc32(&record));
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    /// A backend whose writes can be switched off, standing in for a store
+    /// that has started refusing them.
+    struct Flaky {
+        held: BootStore,
+        writable: bool,
+    }
+
+    // SAFETY: a test double over a plain field; nothing is torn.
+    unsafe impl BootStorage for Flaky {
+        type ReadErr = ();
+        type WriteErr = ();
+
+        fn read_raw(&mut self) -> Result<BootStore, ()> {
+            Ok(self.held)
+        }
+
+        fn write_raw(&mut self, val: BootStore) -> Result<(), ()> {
+            if !self.writable {
+                return Err(());
+            }
+            self.held = val;
+            Ok(())
+        }
+    }
+
+    fn flaky() -> Flaky {
+        Flaky {
+            held: BootStore::default(),
+            writable: true,
+        }
+    }
+
+    /// Records are told apart by their trial count.
+    fn counted(n: u8) -> BootStore {
+        let mut record = BootStore::default();
+        record.boot_state.boot_count = n;
+        record
+    }
+
+    #[test]
+    fn a_working_primary_keeps_the_spare_empty() {
+        let mut store = Fallback::new(flaky(), flaky());
+        store.write(counted(1)).unwrap();
+
+        assert_eq!(store.read().unwrap().boot_state.boot_count, 1);
+        assert_eq!(store.primary.held.boot_state.boot_count, 1);
+        assert!(
+            store.spare.read_raw().unwrap().validated().is_none(),
+            "an untouched spare must not look like it holds the record"
+        );
+    }
+
+    /// The case the whole type exists for: a trial that could not be counted
+    /// is counted anyway, so the bootloader still has somewhere to go.
+    #[test]
+    fn a_failed_primary_write_lands_in_the_spare() {
+        let mut store = Fallback::new(flaky(), flaky());
+        store.write(counted(1)).unwrap();
+
+        store.primary.writable = false;
+        store.write(counted(2)).unwrap();
+
+        assert_eq!(store.read().unwrap().boot_state.boot_count, 2);
+        assert_eq!(
+            store.primary.held.boot_state.boot_count,
+            1,
+            "the primary is behind, which is why the spare wins"
+        );
+    }
+
+    /// The ordering that matters: clearing the spare after a successful
+    /// primary write would leave a reset believing a spare older than the
+    /// primary.
+    #[test]
+    fn a_recovered_primary_takes_the_record_back() {
+        let mut store = Fallback::new(flaky(), flaky());
+        store.primary.writable = false;
+        store.write(counted(1)).unwrap();
+        assert_eq!(store.read().unwrap().boot_state.boot_count, 1);
+
+        store.primary.writable = true;
+        store.write(counted(2)).unwrap();
+
+        assert_eq!(store.primary.held.boot_state.boot_count, 2);
+        assert!(
+            store.spare.read_raw().unwrap().validated().is_none(),
+            "a stale spare would outrank the primary on the next read"
+        );
+        assert_eq!(store.read().unwrap().boot_state.boot_count, 2);
+    }
+
+    /// Losing the spare is losing the writes it was covering for, not losing
+    /// the record: the primary is stale but sound.
+    #[test]
+    fn losing_the_spare_falls_back_to_the_primary() {
+        let mut store = Fallback::new(flaky(), flaky());
+        store.write(counted(1)).unwrap();
+        store.primary.writable = false;
+        store.write(counted(2)).unwrap();
+
+        // What backup RAM reads as once power has been away.
+        store.spare.held = BootStore::default();
+
+        assert_eq!(store.read().unwrap().boot_state.boot_count, 1);
+    }
+
+    /// With neither backend accepting a write there is nothing to report but
+    /// failure, and the caller must see it rather than a false success.
+    #[test]
+    fn both_gone_is_an_error() {
+        let mut store = Fallback::new(flaky(), flaky());
+        store.primary.writable = false;
+        store.spare.writable = false;
+        assert!(store.write(counted(1)).is_err());
     }
 }
