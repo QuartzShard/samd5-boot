@@ -1,6 +1,6 @@
 [package]
 name = "samd5-boot"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 # The floor, not a recommendation: let-chains under edition 2024 and
 # `slice::as_chunks` both landed in 1.88, and nothing here needs more. Firmware

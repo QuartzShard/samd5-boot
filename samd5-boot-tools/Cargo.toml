@@ -10,7 +10,6 @@ keywords = ["bootloader", "firmware-update", "probe-rs", "samd51", "cortex-m"]
 categories = ["embedded", "development-tools", "command-line-utilities"]
 readme = "README.md"
 
-# Standalone workspace, like every other crate in this repository.
 [workspace]
 
 [lib]
@@ -31,11 +30,8 @@ cli = ["dep:clap"]
 anyhow = "1"
 bytemuck = "1.25.2"
 clap = { version = "4", features = ["derive"], optional = true }
-# Caret, not an exact pin: a library that pinned probe-rs would force that
-# exact version on any consumer who also depends on it, and a mismatch is a
-# hard conflict. 0.30 is what this has been tested against on silicon.
 probe-rs = "0.30"
 # The flash ABI, from the crate that defines it: manifest layout, CRC
 # convention and fuse encodings all come from there rather than being
 # restated, so tooling and firmware cannot drift apart.
-samd5-boot = { version = "0.1", path = "..", default-features = false }
+samd5-boot = { version = "1.0.0", path = "..", default-features = false }
