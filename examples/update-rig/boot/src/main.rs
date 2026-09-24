@@ -5,24 +5,25 @@
 //!
 //! # Flow
 //!
-//! 1. `Boot::new` validates the fuses (provisioned off-board); an
+//! 1. The link comes up first, because it also installs the `rprintln!`
+//!    sink (RTT by default, SERCOM5 at 115200 under `--features rs485`).
+//! 2. [`Boot::new`] validates the fuses (provisioned off-board); an
 //!    unprovisioned part parks with a message instead of running any of
 //!    this.
-//! 2. The link comes up (RTT by default, SERCOM5 at 115200 under
-//!    `--features rs485`). There is no listening window: the
-//!    application asks for an update by setting the request flag before it
-//!    resets, and BOOT then waits for the host without a deadline.
-//! 3. A `BeginUpdate { len }` installs: exactly `len`
-//!    raw bytes are pulled off the wire into `Boot::install`, which
-//!    verifies the image, records the trial, and swaps banks. The swap
-//!    reboots, so a successful install never returns; a failed one comes
-//!    back and is reported as `UpdateResult(status)`, after which the
-//!    normal boot path still runs (a rejected update must not cost the
-//!    device its working app).
-//! 4. Otherwise `boot_or_enter_download` verifies the active image
-//!    and jumps to it. It returns only when nothing is bootable, in which
-//!    case the same listen/install pair runs with no deadline, since
-//!    there is nothing to time out into.
+//! 3. [`Boot::boot_or_enter_download`] takes the boot decision, and a jump
+//!    into the active image goes through verification first. It returns
+//!    for an update request, when nothing on the part is known to boot, or
+//!    when a store write failed. There is no listening window, so an
+//!    update is always something the application asked for before it
+//!    reset.
+//! 4. BOOT then waits for a [`Message::BeginUpdate`] with no deadline and
+//!    pulls exactly `len` raw bytes off the wire into [`Boot::install`],
+//!    which verifies the image, records the trial, and swaps banks. The
+//!    swap reboots, so a successful install never returns; a failed one
+//!    comes back and is reported as [`Message::UpdateResult`].
+//! 5. A failed install holds the link open until the host speaks again,
+//!    then the loop returns to step 3: a rejected update must not cost the
+//!    device its working app.
 //!
 //! # The image never lands in RAM
 //!

@@ -1,5 +1,5 @@
 //! Drive a samd5-boot device by hand: read its fuses, write them, place a
-//! bootloader at both bank heads, stamp an image.
+//! bootloader at both bank heads, stamp an image
 //!
 //! Everything here is a thin front end over the library, which is the form to
 //! use from a project's own `xtask` where it can share a build.
@@ -17,8 +17,9 @@ struct Cli {
     /// Target as probe-rs names it, e.g. ATSAMD51J20A.
     #[arg(long, global = true, default_value = "ATSAMD51J20A")]
     chip: String,
-    /// Print what would be written instead of writing it. Reads still happen,
-    /// so the plan is computed against the real part.
+    /// Print the register writes instead of issuing them. Reads still
+    /// happen, so the plan is computed against the real part. `stamp` is
+    /// unaffected and always writes its output file.
     #[arg(long, global = true)]
     dry_run: bool,
     #[command(subcommand)]
@@ -47,18 +48,26 @@ enum Cmd {
         /// Where to keep the pre-erase copy of the user page.
         #[arg(long, default_value = ".")]
         backup_dir: PathBuf,
-        /// Write a saved user page back verbatim, ignoring the other options.
+        /// Write a saved user page back verbatim, ignoring --boot-size,
+        /// --no-lock and --sblk.
         #[arg(long)]
         restore: Option<PathBuf>,
     },
 
     /// Place a bootloader image at the head of both banks.
-    Flash { boot: PathBuf },
+    Flash {
+        /// Raw binary to place, not an ELF.
+        boot: PathBuf,
+    },
 
     /// Stamp a manifest into a linked application image.
     Stamp {
+        /// Linked image with a manifest slot reserved by `install_manifest!`.
         input: PathBuf,
+        /// Where to write the stamped image.
         output: PathBuf,
+        /// Version to record in the manifest. Anti-rollback is not enforced
+        /// yet.
         #[arg(long)]
         version: u16,
     },
@@ -67,10 +76,12 @@ enum Cmd {
     /// an image instead of booting the application.
     ///
     /// The address is where the firmware keeps its record, which depends on
-    /// the store it uses. Only a directly addressable store can be written
-    /// this way: a SmartEEPROM record goes through NVMCTRL and cannot be
-    /// poked.
+    /// the store it uses. The record is written as plain words, with none of
+    /// the SmartEEPROM handshaking a SmartEEPROM store does, so this is for
+    /// a directly addressable store such as backup RAM.
     RequestUpdate {
+        /// Absolute address of the boot record, e.g. 0x47000000 for a
+        /// backup-RAM store at offset 0.
         #[arg(long, value_parser = parse_addr)]
         record_addr: u64,
     },

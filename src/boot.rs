@@ -1,6 +1,17 @@
-//! The bootloader itself: the typestate that walks a boot from "what does
-//! the record say this boot is" through verification to either a jump into
-//! the application or an install of a new one.
+//! The bootloader state machine
+//!
+//! A BOOT binary uses this in four steps. First, build a [`Boot`] from the
+//! NVM, DSU and watchdog with [`Boot::new`], which checks the fuses it will
+//! boot under. Next, either hand the decision to
+//! [`Boot::boot_or_enter_download`] or read [`Boot::disposition`] and match
+//! the [`Disposition`] yourself. Either way, a jump into the active image
+//! goes through [`Boot::verify`]: its `Boot<Verified>` is the only thing
+//! that unlocks [`boot_active`](Boot::<Verified>::boot_active). Finally, a
+//! call that returns instead of booting leaves the binary in download mode,
+//! where it drives its own transport into [`Boot::install`].
+//!
+//! [`Boot::revert`] abandons the active image and swaps back;
+//! [`Boot::free`] hands the peripherals out again.
 //!
 //! Every item here drives NVMCTRL, the DSU or the watchdog, so the whole
 //! module sits behind the `target` feature; a host build of this crate keeps
@@ -24,8 +35,9 @@ use crate::{
     persist::{BankState, BootStorage, BootStore, RevertReason},
 };
 
-/// Live SEESTAT, not the fuse: the reserve the hardware is operating
-/// with right now (DS §25.6.7: 2×SBLK×8 KiB kept clear in each bank).
+/// Live SEESTAT, not the fuse: the reserve the hardware is operating with
+/// right now. The SmartEEPROM keeps 2 × SBLK blocks of 8 KiB clear in each
+/// bank.
 fn see_reserve(nvm: &hal::nvm::Nvm) -> usize {
     // SAFETY: read-only register access
     let regs = unsafe { nvm.registers() };
@@ -74,21 +86,26 @@ pub struct BootConfig {
 }
 
 /// A precondition [`Boot::new`] found unmet: the live fuse configuration is
-/// incompatible with a swap-safe layout. These are provisioning faults: see
-/// `cargo xtask provision`, which sets the fuses off-board.
+/// incompatible with a swap-safe layout. All three are provisioning faults,
+/// fixed off-board with `samd5-boot-tools provision`; each variant's
+/// condition is listed under [`Boot::new`]'s `# Errors`.
 pub enum BootConfigError {
     BootprotMisconfigured,
     SmartEEPROMTooLarge,
     SmartEEPROMReservedSblk,
 }
 
-/// Why an image failed integrity verification. Checked cheap-to-expensive,
-/// so the first failing check is the variant returned.
+/// Why an image failed integrity verification: the first check to fail.
+/// The checks run cheapest first, in the order `BadMagic`,
+/// `VersionMismatch`, `BadLen`, `BadCrc`, which is not the order the
+/// variants are declared in.
 pub enum VerifyError {
     BadMagic,
     VersionMismatch,
     BadCrc,
     BadLen,
+    /// The DSU could not run the CRC at all (unaligned range, PAC unlock,
+    /// bus error), as opposed to a CRC that came back wrong.
     Dsu(hal::dsu::Error),
 }
 
@@ -142,9 +159,16 @@ pub enum Disposition {
     TrialExhausted { attempt: u8 },
     Promote,
     Reject,
+    /// An install recorded its trial but the swap never happened. Swapping
+    /// now finishes it; the image was read-back verified when it was
+    /// written.
     ResumeInstall,
+    /// The active image is condemned and the other bank holds a confirmed
+    /// one. Swapping is the only action needed: the record already says so.
     Rollback,
     UpdateRequested,
+    /// The active image is condemned and no bank holds a confirmed one:
+    /// nothing on the part is known to boot.
     NoImage,
 }
 
@@ -157,9 +181,12 @@ impl<S: SlotState> Boot<S> {
         BANK_SIZE - BOOT_SIZE - see_reserve(&self.nvm)
     }
 
-    /// Streams an image's bytes (file order) into the inactive slot's
-    /// app region, erasing ahead block by block; bounded below the
-    /// slot's SEE reserve, then read-back verified.
+    /// Stream an image's bytes (file order) into the inactive slot's app
+    /// region, then read it back and verify it
+    ///
+    /// Erases ahead block by block, so no separate erase pass is needed,
+    /// and holds the NVM cache disabled while it writes (errata 2.14.1).
+    /// Bounded below the slot's live SmartEEPROM reserve.
     pub fn download(
         &mut self,
         source: impl core::iter::Iterator<Item = u8>,
@@ -180,12 +207,21 @@ impl<S: SlotState> Boot<S> {
     /// Swap which bank occupies each slot and reboot: the mirror BOOT
     /// runs from the other bank to boot the newly installed image.
     ///
+    /// The other bank must already hold a working image. Nothing here
+    /// checks it, and the reset lands in whatever sits at its base:
+    /// [`Boot::install`] reaches this only after [`Boot::download`]'s
+    /// read-back, and [`Boot::fall_back`] only with a bank recorded
+    /// [`BankState::Valid`], but [`Boot::revert`] and the `ResumeInstall`
+    /// and `Rollback` arms of [`Boot::boot_or_enter_download`] reach it
+    /// without checking the destination.
+    ///
     /// Interrupts are disabled first and never restored, because the command
     /// ends in a reset. BKSWRST stalls the AHB interfaces and forbids any NVM
-    /// fetch while it runs (DS 25.6.7), so an interrupt taken during it sends
-    /// the core to a vector it cannot fetch. The window is long enough to
-    /// matter whenever SmartEEPROM is configured: the command then also
-    /// reallocates the SEE sector, erasing and copying before it resets.
+    /// fetch while it runs (DS60001507 section 25.6.7), so an interrupt taken
+    /// during it sends the core to a vector it cannot fetch. The window is
+    /// long enough to matter whenever SmartEEPROM is configured: the command
+    /// then also reallocates the SEE sector, erasing and copying before it
+    /// resets.
     pub fn swap_reboot(mut self) -> ! {
         cortex_m::interrupt::disable();
         unsafe { self.nvm.bank_swap() }
@@ -198,8 +234,16 @@ impl<S: SlotState> Boot<S> {
         }
     }
 
-    /// Download an image into the inactive slot, mark it for a trial
-    /// boot, and swap the banks (which reboots). Returns only on failure.
+    /// Download an image into the inactive slot, verify it, mark it for a
+    /// trial boot, and swap the banks (which reboots)
+    ///
+    /// Returns only on failure, handing the [`Boot`] back in an
+    /// [`Aborted`].
+    ///
+    /// Clears the confirm and reject flags as it records the trial: both
+    /// refer to the image being replaced, and carrying one over would let
+    /// the outgoing image's confirmation promote the incoming one before it
+    /// has served a trial at all.
     pub fn install<St: BootStorage>(
         mut self,
         store: &mut St,
@@ -214,10 +258,6 @@ impl<S: SlotState> Boot<S> {
         }
         record.boot_state.mark_new(&self.inactive_bank());
         record.boot_state.boot_count = 0;
-        // Confirm and reject refer to the image being replaced. Carrying
-        // them over would let the outgoing image's confirmation promote the
-        // incoming one on its very first boot, so it would never serve a
-        // trial at all.
         record.mailbox.set_confirmed(false);
         record.mailbox.set_rejected(false);
         if let Err(e) = store.write(record) {
@@ -323,8 +363,8 @@ impl<S: SlotState> Boot<S> {
     ///
     /// BOOTPROT covers only the BOOT at the base of the *active* bank, which
     /// leaves the mirror in the inactive bank writable. The power-on
-    /// default should come from the user page's region lock bits (see
-    /// `cargo xtask provision`); this re-asserts it at runtime.
+    /// default should come from the user page's region lock bits (written by
+    /// `samd5-boot-tools provision`); this re-asserts it at runtime.
     ///
     /// Idempotent and non-clobbering: the current `RUNLOCK` is
     /// read back and only the BOOT bits are cleared, so locks the
@@ -343,8 +383,24 @@ impl<S: SlotState> Boot<S> {
 }
 
 impl Boot<Unverified> {
-    /// Construct the bootloader, validating the fuse configuration it will boot
-    /// under (see [`BootConfigError`]).
+    /// Construct the bootloader, validating the fuse configuration it will
+    /// boot under
+    ///
+    /// Also re-asserts the BOOT region locks with
+    /// [`Boot::lock_boot_regions`]. A part that will not take them is not
+    /// refused: the image is intact either way, and BOOTPROT still covers
+    /// the active copy.
+    ///
+    /// # Errors
+    ///
+    /// * Returns [`BootConfigError::BootprotMisconfigured`] if the user
+    ///   page's BOOTPROT field is not [`BOOTPROT_VALUE`], so BOOT is
+    ///   protected to the wrong size or not at all.
+    /// * Returns [`BootConfigError::SmartEEPROMReservedSblk`] if
+    ///   `Nvmctrl.SEESTAT.SBLK` is above 10, a reserved encoding.
+    /// * Returns [`BootConfigError::SmartEEPROMTooLarge`] if the
+    ///   SmartEEPROM reserve and the BOOT region together leave no
+    ///   application region in a bank.
     pub fn new(
         nvm: hal::nvm::Nvm,
         dsu: hal::dsu::Dsu,
@@ -377,9 +433,25 @@ impl Boot<Unverified> {
         Ok(boot)
     }
 
-    /// Read the stored boot record and classify what this boot should
-    /// do, without acting on it. Hands back the record it read so the
-    /// caller can act without reading it a second time.
+    /// Read the stored boot record and classify what this boot should do,
+    /// without acting on it
+    ///
+    /// Hands back the record it read so the caller can act without reading
+    /// it a second time.
+    ///
+    /// The checks run in this order and the first match wins:
+    ///
+    /// 1. The inactive bank is [`BankState::New`]: an install recorded its
+    ///    trial but never swapped, so [`Disposition::ResumeInstall`].
+    /// 1. [`rejected`](crate::persist::UpdateMailbox::rejected):
+    ///    [`Disposition::Reject`].
+    /// 1. The active bank is `New` and
+    ///    [`confirmed`](crate::persist::UpdateMailbox::confirmed):
+    ///    [`Disposition::Promote`]. A confirm about an image that is not on
+    ///    trial is left alone.
+    /// 1. [`request_update`](crate::persist::UpdateMailbox::request_update):
+    ///    [`Disposition::UpdateRequested`].
+    /// 1. Otherwise the active bank's own [`BankState`] decides.
     pub fn disposition<St: BootStorage>(
         &self,
         store: &mut St,
@@ -388,10 +460,6 @@ impl Boot<Unverified> {
         let active = record.boot_state.bank(&self.nvm.first_bank());
         let inactive = record.boot_state.bank(&self.inactive_bank());
         let mailbox = record.mailbox;
-        // Precedence: finishing an interrupted install overrides stale
-        // flags about the image it replaces; an explicit reject or
-        // confirm about the running image comes before a download
-        // request; then the active image's own state decides.
         let disposition = if inactive == BankState::New {
             Disposition::ResumeInstall
         } else if mailbox.rejected() {
@@ -418,11 +486,20 @@ impl Boot<Unverified> {
         Ok((disposition, record))
     }
 
-    /// Default handling of [`Boot::disposition`]: boots the image (or
-    /// swaps banks and reboots) on every bootable outcome, and returns
-    /// `self` for the caller to enter download mode when an update was
-    /// requested or nothing is bootable. Write your own match over
-    /// `disposition` instead to add your own validation or bookkeeping.
+    /// Default handling of [`Boot::disposition`]: boot the image, or swap
+    /// banks and reboot, on every bootable outcome
+    ///
+    /// Returns `self` for the caller to enter download mode in three
+    /// cases: the application asked for an update, nothing on the part is
+    /// known to boot, or a store write failed, which leaves no way to
+    /// record the promotion, trial or revert this boot called for. A store
+    /// that cannot be *read* is not one of them: the record is taken to be
+    /// the fresh default and the boot proceeds as
+    /// [`Disposition::SteadyBoot`], so the active image is still verified
+    /// before the jump.
+    ///
+    /// Match over [`Disposition`] yourself instead to add your own
+    /// validation or bookkeeping.
     pub fn boot_or_enter_download<St: BootStorage>(self, store: &mut St) -> Self {
         let (disposition, mut record) = self
             .disposition(store)
@@ -523,8 +600,19 @@ impl Boot<Verified> {
         self.boot_active()
     }
 
-    /// Returns only if the store write fails. The count must land
-    /// before the jump, or a crash loop never gets counted.
+    /// Count this trial boot, arm the trial watchdog, then jump
+    ///
+    /// Increments [`boot_count`](crate::persist::BootState::boot_count) and
+    /// commits `record` before starting the watchdog at
+    /// [`BootConfig::trial_timeout`], so a crash loop is counted even when
+    /// the image never reaches its own code. The application takes the
+    /// watchdog over with
+    /// [`confirm`](crate::client::BootClient::confirm); an image that does
+    /// not is reset until [`BootConfig::max_boot_attempts`] is spent, at
+    /// which point [`Boot::disposition`] returns
+    /// [`Disposition::TrialExhausted`].
+    ///
+    /// Returns only if the store write fails.
     pub fn boot_trial<St: BootStorage>(
         mut self,
         store: &mut St,

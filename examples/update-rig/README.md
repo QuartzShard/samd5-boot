@@ -1,8 +1,9 @@
 # The update rig: samd5-boot's self-test
 
 This is the worked integration of `samd5-boot`, and it doubles as the
-crate's test suite. Everything the library can do is driven from a host and
-reported as PASS/FAIL lines.
+crate's test suite: eight checks over install, verify, trial, confirm,
+reject, rollback and the update window, each driven from a host and
+reported as a PASS/FAIL line.
 
 ```
 $ cargo xtask test --chip ATSAMD51J20A
@@ -38,51 +39,11 @@ The rig speaks a byte stream, and it does not much care what carries it.
   the property RTT cannot demonstrate.
 
 The firmware picks one at compile time (`rtt` / `rs485` features on `boot`
-and `app`); `cargo xtask` builds and drives whichever you asked for, and
-refuses to attach if the firmware on the part speaks the other one.
-
-### What a buffered transport costs
-
-The same property has one sharp edge. A reply written into a RAM ring is
-not gone from the device the way bytes put on a wire are: the image that
-boots next zeroes `.bss` on its way up, and over RTT that is the very buffer
-holding it. BOOT therefore holds the link open after reporting a failed
-install until the host says something, so the report cannot be wiped before
-it is read. Without that, a rejected image looks to the host exactly like a
-successful one, since a successful install is the case where BOOT swaps and
-never replies at all.
-
-### Why RTT makes the bootloader's life easier
-
-Streaming an image into `Boot::install` is awkward because the writer stops
-reading for tens of milliseconds at every page program, and again at every
-block erase. Over a UART those bytes are simply gone, which is why
-`demo-serial` carries an 8 KiB interrupt-fed ring and why an unpaced host
-used to fail right after page 0.
-
-Over RTT the buffer *is* the transport. The host writes into a ring in RAM
-and the target drains it when it gets around to it; a full ring makes the
-host's write report a short count, and it tries again. Nothing is lost
-because nothing was ever in flight.
-
-### Finding the link again after a reset
-
-Every reset hands the link from BOOT to the application or back, and their
-control blocks are at different addresses, so the host has to find the new
-one. Searching RAM for it is far too slow to repeat: a trial image is
-watchdog-reset every few seconds by design, and a scan does not reliably fit
-between two resets.
-
-So the firmware publishes the address in a fixed backup-RAM slot, which
-works because the linker never allocates from backup RAM and a `static`
-cannot be pinned to a literal address from Rust alone. **The slot is
-single-use**: the host clears the magic once it has used the address. That
-turns it from a value that might be stale into a statement of fact, since
-backup RAM survives a reset and a left-behind address would go on naming a
-block that had since been zeroed. A magic that is present means firmware has
-come up and published since anyone last looked, which is exactly the reset
-signal the host needs; a magic that is absent means nothing has changed
-hands.
+and `app`); `cargo xtask` builds and drives whichever you asked for. A
+mismatch shows up two ways: over RTT the attach fails, naming the channels
+it did find, while a serial port opens perfectly well and simply stays
+quiet. `cargo xtask test` recovers from both the same way, by asking BOOT
+to wait through the debugger.
 
 ## What you need
 
@@ -136,13 +97,13 @@ cargo xtask request-update --chip <CHIP>  make BOOT wait, from the debugger
 cargo xtask link  --chip <CHIP> <op>
 ```
 
-Add `--log` to `test` (or drop `--quiet` from `link`, where it is on by
-default) to forward the target's `rprintln!` output to stderr, prefixed
-`target|`. It is the first thing to turn on when a step fails for no
-visible reason.
-
 where `<op>` is one of `ping`, `state`, `update <image>`, `bogus <image>`,
 `reboot`, `reset`, `reject`. Add `--port <dev>` to any of them to use RS485.
+
+Add `--log` to `test` to forward the target's `rprintln!` output to stderr,
+prefixed `target|`; `link` forwards it already, and `--quiet` turns it off.
+RTT only, and the first thing to turn on when a step fails for no visible
+reason.
 
 `flash` cannot simply write both heads on a provisioned part, because
 BOOTPROT protects the active bank's head: it writes the inactive head,
@@ -166,9 +127,9 @@ with the NVM cache off.
   has to win, and a general purpose host has no timing guarantees at all.
   The application sets the mailbox request flag before it resets and BOOT
   then waits with no deadline.
-- `app`: the payload, in two builds that differ only in whether they confirm
-  themselves. The no-confirm build is what makes the rollback paths
-  reachable.
+- `app`: the payload, in two builds. One confirms itself; the other does not
+  and reports a different `app_version`, which is both what makes the
+  rollback paths reachable and how the host tells the two apart.
 
 The host end lives in `xtask` (`src/link/`, `src/selftest.rs`), because the
 RTT transport needs probe-rs and the xtask already has it.
@@ -176,6 +137,51 @@ RTT transport needs probe-rs and the xtask already has it.
 The trial record lives in backup RAM rather than SmartEEPROM, so it survives
 the BKSWRST reset while a power cut reads back as a blank slate. That keeps
 the rig's bookkeeping independent of the SEE fuses.
+
+## Why the transports behave differently
+
+### What a buffered transport costs
+
+Buffering in the target's RAM has one sharp edge. A reply written into a RAM
+ring is not gone from the device the way bytes put on a wire are: the image
+that boots next zeroes `.bss` on its way up, and over RTT that is the very
+buffer holding it. BOOT therefore holds the link open after reporting a failed
+install until the host says something, so the report cannot be wiped before
+it is read. Without that, a rejected image looks to the host exactly like a
+successful one, since a successful install is the case where BOOT swaps and
+never replies at all.
+
+### Why RTT makes the bootloader's life easier
+
+Streaming an image into `Boot::install` is awkward because the writer stops
+reading for tens of milliseconds at every page program, and again at every
+block erase. Over a UART those bytes are simply gone, which is why
+`demo-serial` carries an 8 KiB interrupt-fed ring and why an unpaced host
+used to fail right after page 0.
+
+Over RTT the buffer *is* the transport. The host writes into a ring in RAM
+and the target drains it when it gets around to it; a full ring makes the
+host's write report a short count, and it tries again. Nothing is lost
+because nothing was ever in flight.
+
+### Finding the link again after a reset
+
+Every reset hands the link from BOOT to the application or back, and their
+control blocks are at different addresses, so the host has to find the new
+one. Searching RAM for it is far too slow to repeat: a trial image is
+watchdog-reset every few seconds by design, and a scan does not reliably fit
+between two resets.
+
+So the firmware publishes the address in a fixed backup-RAM slot, which
+works because the linker never allocates from backup RAM and a `static`
+cannot be pinned to a literal address from Rust alone. **The slot is
+single-use**: the host clears the magic once it has used the address. That
+turns it from a value that might be stale into a statement of fact, since
+backup RAM survives a reset and a left-behind address would go on naming a
+block that had since been zeroed. A magic that is present means firmware has
+come up and published since anyone last looked, which is exactly the reset
+signal the host needs; a magic that is absent means nothing has changed
+hands.
 
 ## When the application will not step aside
 

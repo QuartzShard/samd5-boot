@@ -3,18 +3,20 @@
 //! page only exists once a real byte arrived); [`FlashWriter::write`]
 //! burns the page stream, the first page of each 16-page block erasing
 //! it ahead so no separate erase pass is needed. The errata 2.14.1
-//! cache disable is held for the writer's lifetime; Drop restores the
-//! previous cache configuration and nothing else, so an early `?`-exit
-//! never writes a half-filled page.
+//! cache disable is held for the writer's lifetime and Drop restores
+//! the previous `CACHEDIS0`/`CACHEDIS1` bits, nothing more. The writer
+//! buffers no partial page, since [`pages`] only ever yields whole
+//! 0xFF-padded pages, so an early `?`-exit stops on a page boundary.
 
 use crate::consts::{self, ERASED, PAGE_SIZE_WORDS};
 use atsamd_hal::nvm::{self, Nvm, WriteGranularity};
 
-/// A failure while writing an image into the inactive slot.
+/// A failure while writing an image into the inactive slot
 pub enum FlashError {
-    /// An erase or program command returned an NVMCTRL error.
+    /// An erase or program command returned an NVMCTRL error
     Nvm(nvm::Error),
-    /// The stream ran past the writer's `end` bound.
+    /// The image ran past the end of the destination region: the inactive
+    /// slot's application area, less the live SmartEEPROM reserve.
     ImageTooLarge,
 }
 
@@ -28,6 +30,8 @@ type Page = [u32; PAGE_SIZE_WORDS];
 
 const ERASED_BYTE: u8 = ERASED.to_le_bytes()[0];
 
+/// Page-at-a-time writer for one flash region, erasing a block ahead of the
+/// first page of each
 pub struct FlashWriter<'nvm> {
     nvm: &'nvm mut Nvm,
     begin: usize,
@@ -38,11 +42,16 @@ pub struct FlashWriter<'nvm> {
 impl<'nvm> FlashWriter<'nvm> {
     /// # Safety
     ///
-    /// `begin` must be block-aligned and `begin..end` valid to erase
-    /// and program, holding no currently executing code. The
-    /// erase-ahead destroys it.
+    /// `begin` and `end` are absolute flash addresses, `end` exclusive.
+    /// Both must be block-aligned
+    /// ([`ERASE_BLOCK_SIZE`](crate::consts::ERASE_BLOCK_SIZE)): the
+    /// erase-ahead erases a whole block at a time and is not bounded by
+    /// `end`, so an `end` inside a block destroys the rest of that block as
+    /// well. `begin..end` must be valid to erase and program and must hold
+    /// no currently executing code; the erase-ahead destroys it.
     ///
-    /// NVM.CTRLA.CACHEDIS0/1 must not be altered while this type is alive
+    /// `Nvmctrl.CTRLA.{CACHEDIS0,CACHEDIS1}` must not be altered while this
+    /// type is alive.
     pub unsafe fn new(nvm: &'nvm mut Nvm, begin: usize, end: usize) -> Self {
         // Errata 2.14.1: NVM reads corrupt while the page buffer is being
         // written; workaround = CTRLA.CACHEDIS0/1 while programming.
@@ -66,7 +75,7 @@ impl<'nvm> FlashWriter<'nvm> {
     }
 
     /// Burn the whole page stream; consumes the writer, so the cache
-    /// configuration is restored on return, error paths included.
+    /// configuration is restored on return, error paths included
     pub fn write(mut self, pages: impl Iterator<Item = Page>) -> Result<(), FlashError> {
         pages
             .enumerate()
@@ -102,6 +111,8 @@ impl Drop for FlashWriter<'_> {
     }
 }
 
+/// Re-chunk a byte stream into little-endian words, 0xFF-padding a short
+/// tail
 pub fn words(mut bytes: impl Iterator<Item = u8>) -> impl Iterator<Item = u32> {
     core::iter::from_fn(move || {
         Some(u32::from_le_bytes([
@@ -113,6 +124,7 @@ pub fn words(mut bytes: impl Iterator<Item = u8>) -> impl Iterator<Item = u32> {
     })
 }
 
+/// Re-chunk a word stream into whole pages, 0xFF-padding the last one
 pub fn pages(mut words: impl Iterator<Item = u32>) -> impl Iterator<Item = Page> {
     core::iter::from_fn(move || {
         let mut page = [ERASED; PAGE_SIZE_WORDS];

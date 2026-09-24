@@ -1,15 +1,23 @@
-//! Placing BOOT at the head of both banks.
+//! Place BOOT at the head of both banks
 //!
-//! The awkward part is that BOOTPROT protects only the head of the *active*
-//! bank, so on a provisioned part one of the two copies cannot be written
-//! where it sits. The silicon's own answer is to use the swap: write the
-//! inactive head, swap, write the head that is now inactive, swap back. Two
-//! swaps leave the same bank active as before, so the application that was
-//! running is still the one that will run.
+//! [`run`] is the whole module: it reads `STATUS`, writes both heads, and
+//! reads them back against the file.
 //!
-//! Issuing BKSWRST from the debugger rather than asking a cooperating
-//! application to do it is what makes this work on a part whose application
-//! is missing or broken.
+//! BOOTPROT protects only the head of the *active* bank, so on a part whose
+//! BOOTPROT is set one of the two copies cannot be written where it sits.
+//! The way round is the swap: write the inactive head, `BKSWRST`, write the
+//! head that is now inactive, swap back. Two swaps leave the same bank
+//! active as before, so the application that was running is still the one
+//! that will run. With BOOTPROT at 15 or `STATUS.BPDIS` set, both heads are
+//! written where they are.
+//!
+//! Issuing `BKSWRST` from the debugger, rather than asking a cooperating
+//! application to do it, is what makes this work on a part whose
+//! application is missing or broken.
+//!
+//! Region locks are a separate protection from BOOTPROT:
+//! [`crate::provision`] locks the BOOT regions of *both* banks unless asked
+//! not to, and nothing here reads `RUNLOCK` or unlocks anything.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -20,9 +28,14 @@ use samd5_boot::consts::geometry;
 
 use crate::probe::{Cmd, Device, Mode};
 
-/// Long enough for the part to come back from a BKSWRST and be halted again.
+/// Long enough for the part to come back from a BKSWRST and be halted again
 const RESWAP_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Place `boot_bin` at the head of both banks and read both back
+///
+/// `boot_bin` is a raw binary written at each bank base, not an ELF. Only
+/// the BOOT region is erased; the application in the rest of each bank is
+/// left alone. Fails if either head does not read back as the file.
 pub fn run(chip: &str, boot_bin: &Path, mode: Mode) -> Result<()> {
     let image = std::fs::read(boot_bin)
         .with_context(|| format!("reading {}", boot_bin.display()))?;
@@ -93,7 +106,7 @@ fn download(device: &mut Device, bin: &Path, base_address: u64) -> Result<()> {
     Ok(())
 }
 
-/// Swap the banks and wait for the part to come back halted.
+/// Swap the banks and wait for the part to come back halted
 ///
 /// BKSWRST resets as part of the swap, so the core is gone the moment the
 /// command takes; there is nothing to poll on the far side except the halt

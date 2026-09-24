@@ -1,5 +1,9 @@
 //! The host end of the demo protocol, over whichever transport the rig has.
 //!
+//! Open a transport ([`rtt::RttLink::attach`] or [`serial::Serial::open`]),
+//! wrap it in [`Link::new`], then [`Link::send`] and [`Link::recv`]; after a
+//! device reset call [`Link::resync`] before the next exchange.
+//!
 //! Framing is the same either way (COBS-delimited postcard, with a raw image
 //! body following a `BeginUpdate`), so it lives here once and the transports
 //! only have to move bytes.
@@ -130,8 +134,9 @@ impl<T: Transport> Link<T> {
 
     /// Round-trip a `Ping`, returning the payload the device echoed.
     ///
-    /// BOOT answers pings whether or not an application exists, so a reply
-    /// proves only that something on the far end is alive.
+    /// Both the application and BOOT (while it waits for an image) answer
+    /// pings, so a reply proves only that something on the far end is
+    /// alive. `GetState` is what tells the two apart.
     pub fn ping(&mut self, payload: [u8; 8], timeout: Duration) -> Result<[u8; 8]> {
         self.resync()?;
         self.send(&Message::Ping(payload))?;

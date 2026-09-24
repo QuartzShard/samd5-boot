@@ -1,8 +1,11 @@
-//! Building and stamping the demo images.
+//! Building and stamping the demo images. [`build_demo`] is the entry
+//! point and [`Artifacts::in_demo_dir`] names what it writes.
 //!
-//! The manifest stamp comes from `samd5_boot::manifest::stamp`, the same
-//! code and the same offsets BOOT reads back, so an image that stamps here
-//! is one `check_slot` accepts by construction.
+//! Stamping goes through `samd5_boot_tools::image::stamp` onto
+//! `samd5_boot::manifest::stamp`, the same code and the same offsets BOOT
+//! reads back, so a stamped image carries the CRCs `Boot::verify`
+//! recomputes. Verification also bounds `image_len` by the app region,
+//! which stamping cannot check.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,10 +15,13 @@ use samd5_boot_tools::image::stamp;
 
 const TRIPLE: &str = "thumbv7em-none-eabihf";
 
-/// The two application builds the self-test needs. They differ only in
-/// whether the image confirms itself, and carry different versions so the
-/// host can tell from the wire which one a device came back running.
+/// Stamped into the manifest of the confirming build.
+///
+/// Must match the `APP_VERSION` const in `examples/update-rig/app`, which
+/// is what the image reports on the wire; the self-test compares the two.
 pub const APP_VERSION: u16 = 1;
+/// Stamped into the manifest of the `noconfirm` build, which never confirms
+/// itself. Must match that crate's `APP_VERSION` under `noconfirm`.
 pub const APP_NOCONFIRM_VERSION: u16 = 2;
 
 pub struct Artifacts {
@@ -79,6 +85,11 @@ impl Transport {
     }
 }
 
+/// Build both application images and BOOT for `transport`, stamp the two
+/// applications, and return where they landed.
+///
+/// Also leaves the unstamped `app-raw.bin` and `app-nc-raw.bin` in the demo
+/// directory.
 pub fn build_demo(transport: Transport) -> Result<Artifacts> {
     let demo = demo_dir();
     let out = Artifacts::in_demo_dir();
@@ -103,9 +114,10 @@ pub fn build_demo(transport: Transport) -> Result<Artifacts> {
     Ok(out)
 }
 
-/// Stamp a linked image so BOOT will verify it, reporting what went in.
-/// Flip a byte in the middle of the body: past the vector table, inside
-/// the range the device's CRC covers. Returns the offset it flipped.
+/// Invert one byte in the middle of the image and return its offset.
+///
+/// The midpoint of a demo image is past the vector table and inside the
+/// range `crc32_image` covers, so the device fails it in verification.
 pub fn corrupt_body(image: &mut [u8]) -> usize {
     let at = image.len() / 2;
     image[at] ^= 0xFF;

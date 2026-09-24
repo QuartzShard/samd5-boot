@@ -1,4 +1,5 @@
-//! Wire protocol shared by the RS485 host tool and the SAMD51 firmware.
+//! Wire protocol shared by the rig's host tool and the SAMD51 firmware, over
+//! either transport.
 //!
 //! Control traffic is a single [`Message`] enum, postcard-serialized and
 //! COBS-framed (a `0x00` delimiter ends each frame). After a

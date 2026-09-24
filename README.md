@@ -16,32 +16,26 @@ verification by DSU CRC32, and rollback on failure driven by the watchdog.
 
 ## Status
 
-Every call path is exercised on real silicon by
+The install, verify, trial, confirm, reject, attempts-exhausted rollback
+and app-requested update paths are exercised on real silicon by
 [`examples/update-rig`](examples/update-rig), which is both the worked
-integration and the test suite: install, verify, trial, confirm, reject,
-attempts-exhausted rollback, and the app-requested update window, each
-asserted against a device that really rebooted into the image under test.
+integration and the test suite: eight checks, each asserted against a
+device that really rebooted into the image under test. Resuming an
+interrupted install, rolling back from an interrupted revert, and coming
+up with nothing bootable have no test yet.
 
 The rig runs over RTT by default, so reproducing it needs nothing but a
 debug probe, and over RS485 on request, which is the configuration that
 proves an update works with no debugger in the loop.
 
 The ABI is not frozen. P-256 image signing is reserved in the manifest and
-not implemented; `manifest_len` and a rollback counter are still to be added
-before 1.0.
+not implemented, and so is anti-rollback: the manifest's `version` field
+and the stored `Rollback` watermark are written but never compared. A
+manifest length field is still to be added before 1.0.
 
-Provisioning a fresh part is `cargo xtask provision`, and placing BOOT at
-both bank heads on a protected part is `cargo xtask flash`; both are proven
-on silicon.
-
-The predecessor, a shell script driving `probe-rs write`, could not work:
-the CLI attaches and detaches per invocation and never halts the core, so
-the erase, the page-buffer fill and the quad-word commits did not survive as
-one sequence, while the running bootloader drove NVMCTRL at the same time.
-Errata NVM101-7 cache pollution then made the read-backs look convincing.
-Driving probe-rs as a library instead gives one attach, a halted core, word
--wide writes into the page buffer (byte writes are silently dropped), and a
-read-back after the reset that actually re-latches the fuses.
+Provisioning a fresh part is `samd5-boot-tools provision`, and placing BOOT
+at both bank heads on a protected part is `samd5-boot-tools flash`; both are
+proven on silicon.
 
 ## Using it
 
@@ -70,8 +64,8 @@ waits for an image on whatever transport you plug in:
 
 ```rust
 let boot = Boot::new(nvm, dsu, wdt, config)?;
-let boot = boot.boot_or_enter_download(&mut store);   // returns only if nothing boots
-let (err, boot) = boot.install(&mut store, record, image_bytes);
+let boot = boot.boot_or_enter_download(&mut store);   // returns only to enter download
+let Aborted { error, boot } = boot.install(&mut store, record, image_bytes);
 ```
 
 `install` takes an `Iterator<Item = u8>`, so an image is pulled through one
@@ -95,9 +89,10 @@ image is running again.
 ## Getting a bootloader onto a part
 
 The operations that need a debug probe rather than a compiler (writing the
-fuses, placing BOOT at both bank heads, stamping an image) are
+fuses, placing BOOT at both bank heads) are
 [`samd5-boot-tools`](samd5-boot-tools), a separate crate because it drives
-probe-rs, which has no place in a `no_std` dependency.
+probe-rs, which has no place in a `no_std` dependency. It carries the
+post-link `stamp` step too, which needs no probe.
 
 ```
 cargo install samd5-boot-tools
@@ -116,7 +111,7 @@ and `stamp` directly and keep them in its existing build, which is what the
 [repository](https://github.com/QuartzShard/samd5-boot) and is not published:
 it is the worked integration, not a product. Clone it to run the suite.
 
-It is also the test suite: every call path driven from a host and reported as
+It is also the test suite: eight checks driven from a host and reported as
 PASS/FAIL, over RTT (which needs only a debug probe) or RS485. On an
 ATSAMD51J20A with a probe attached:
 
@@ -156,9 +151,10 @@ cargo xtask test      --chip <CHIP> [--port <dev>]
   sectors, which widens that window to milliseconds. `swap_reboot` disables
   them; anything that reaches `BKSWRST` by another route must too.
 - **BOOTPROT covers only the active bank's head.** The inactive copy is
-  writable, so replacing a bootloader means clearing BOOTPROT, writing both
-  heads, and setting it again, rather than writing one head and trusting the
-  image being replaced to swap into it.
+  writable, so replacing a bootloader means writing the inactive head,
+  issuing `BKSWRST`, writing the head that is now inactive, and swapping
+  back, rather than writing one head and trusting the image being replaced
+  to swap into it. Two swaps leave the same bank active as before.
 - **A chip erase does not clear BOOTPROT**, the region locks, or the rest of
   the user page.
 

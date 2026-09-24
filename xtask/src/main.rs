@@ -107,9 +107,11 @@ enum Cmd {
         /// RTT. The firmware must have been built with `--features rs485`.
         #[arg(long, short)]
         port: Option<String>,
-        /// Use the images and the BOOT already on the part.
+        /// Use the images already in `examples/update-rig/` rather than
+        /// rebuilding them.
         #[arg(long)]
         skip_build: bool,
+        /// Leave the BOOT already on the part in place.
         #[arg(long)]
         skip_flash: bool,
         /// Forward the target's log output (RTT only). The first thing to
@@ -120,6 +122,7 @@ enum Cmd {
 
     /// Send one message to a device that is already running.
     Link {
+        /// Ignored when `--port` is given.
         #[arg(long)]
         chip: String,
         /// Use RS485 on this serial device instead of RTT.

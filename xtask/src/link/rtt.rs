@@ -1,6 +1,13 @@
 //! The protocol over RTT: two ring buffers in the target's RAM, read and
 //! written through the debug probe while the core runs.
 //!
+//! [`RttLink::attach`] claims the probe and yields the [`Transport`] that
+//! [`Link`](super::Link) frames over. Channel 1 up and channel 0 down
+//! carry the protocol; channel 0 up carries `rprintln!` output, forwarded
+//! only when `log` is set. Dropping the link releases the probe, which
+//! anything that needs its own debug session (`flash`, `provision`) is
+//! waiting on.
+//!
 //! # Surviving a reset
 //!
 //! Every reset in the test hands the link from BOOT to the application or
@@ -9,9 +16,10 @@
 //! The control block moves, because the two images are separate binaries
 //! whose blocks sit at different addresses, so a reconnect has to be able
 //! to re-find it. Scanning RAM for that is far too slow to do repeatedly,
-//! for the reason `demo_rig::RTT_POINTER_ADDR` documents, so the firmware
-//! publishes the address instead in that fixed backup-RAM slot. A
-//! reconnect is then two small reads.
+//! for the reason `demo_rig::RTT_POINTER_OFFSET` documents, so the
+//! firmware publishes the address instead in that fixed backup-RAM slot.
+//! A reconnect is then one two-word read and an attach at the address it
+//! holds.
 //!
 //! **The slot is single-use.** Backup RAM survives a reset, so a value left
 //! in it would go on naming the previous image's block long after that block
@@ -51,9 +59,10 @@ const DOWN: usize = 0;
 /// firmware's control block is an error rather than a silent timeout.
 const CHANNEL_NAME: &str = "samd5-boot";
 
-/// How long to keep rescanning for a control block before giving up. Covers
-/// a reset, the bootloader's fuse checks and the image verify that can
-/// precede the firmware reaching its `Link::new`.
+/// How long to keep rescanning for a control block before giving up.
+/// Both images build theirs at the top of `main`, so this covers the
+/// reset itself and, when the application is the one coming up, BOOT's
+/// CRC verify ahead of it.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct RttLink {
@@ -62,8 +71,9 @@ pub struct RttLink {
     session: Option<Session>,
     rtt: Option<Rtt>,
     chip: String,
-    /// Forward the target's `rprintln!` output. Off by default so the
-    /// self-test's PASS/FAIL lines stand alone.
+    /// Forward the target's `rprintln!` output to stderr. `xtask test`
+    /// leaves it off unless `--log`, so the PASS/FAIL lines stand alone;
+    /// `xtask link` forwards unless `--quiet`.
     log: bool,
     /// Partial line held back so a log line split across two reads is not
     /// printed as two.
@@ -112,7 +122,7 @@ impl RttLink {
 
     /// Whether the control block being held is still the live one. The image
     /// that comes up after a reset zeroes it on its way through `.bss`, so
-    /// the magic going away is how a handover is noticed.
+    /// the `SEGGER RTT` ID string going away is how a handover is noticed.
     fn block_is_live(&mut self) -> bool {
         let Some((session, rtt)) = self.parts() else {
             return false;
@@ -233,10 +243,10 @@ fn attach(session: &mut Session, region: &ScanRegion) -> Result<Rtt> {
 }
 
 impl Transport for RttLink {
-    /// A failure here means the link is momentarily unusable, not that the
-    /// exchange is lost: the device is most likely mid-reset. Reporting "no
-    /// bytes" lets the caller's own deadline decide, and `reconnect` is what
-    /// puts it back together.
+    /// Never fails: a dropped session, a missing channel and a failed read
+    /// all report as no bytes, since the usual cause is a device mid-reset.
+    /// The caller's own deadline decides when to give up, and
+    /// [`Transport::reconnect`] is what puts the link back together.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.drain_log();
         Ok(self.read_channel(UP, buf))
@@ -254,8 +264,8 @@ impl Transport for RttLink {
                 .down_channel(DOWN)
                 .ok_or_else(|| anyhow::anyhow!("down channel {DOWN} is missing"))?;
             // A short write means the target has not drained the ring yet.
-            // Nothing is lost by waiting, which is the whole reason this
-            // transport needs no flow control of its own.
+            // Nothing is lost by waiting, so this transport needs no flow
+            // control of its own.
             let n = channel.write(&mut core, rest).context("writing to RTT")?;
             rest = &rest[n..];
             if n == 0 && Instant::now() >= deadline {

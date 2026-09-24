@@ -1,8 +1,8 @@
 //! Application image manifest: the fixed-layout descriptor BOOT reads to
 //! verify an image before booting it. The application embeds one with
 //! [`install_manifest!`](crate::install_manifest), which links it at
-//! [`MANIFEST_OFFSET`](crate::consts::MANIFEST_OFFSET) inside the app region;
-//! BOOT reads it there and checks it in `Boot::verify`.
+//! [`MANIFEST_OFFSET`] inside the app region; BOOT reads it there and checks
+//! it in `Boot::verify`.
 //!
 //! The manifest is a frozen flash ABI: an installed BOOT must read manifests
 //! from applications built years later, so new fields are append-only and
@@ -12,19 +12,17 @@
 //!
 //! ## Signing reservation (weak-frozen)
 //!
-//! The layout carries everything image signing needs so it can arrive
-//! without an ABI break: [`ManifestBody::sig`] (64 bytes, sized for an
-//! ECDSA P-256 `r || s`), [`ManifestBody::pubkey_id`] (which trusted key
-//! signed it, selecting among the public keys baked into BOOT), and
-//! [`ManifestBody::sig_scheme`] (which algorithm, see [`SigScheme`]). The
-//! current CRC-only phase leaves the scheme at [`SigScheme::Unsigned`]
-//! and `sig` all `0xFF`. When signing lands the signature covers the image
-//! with its own bytes excluded (image start to `sig`, then past `sig` to
-//! `image_len`), hashed with SHA-256; the CRCs stay as a cheap pre-check.
+//! Nothing here signs or checks a signature. [`stamp`] writes
+//! [`SigScheme::Unsigned`] and fills `sig` with `0xFF`, and `Boot::verify`
+//! never reads [`ManifestBody::sig_scheme`], so an image that claims a
+//! scheme is still accepted on its CRCs alone. The reservation is the
+//! layout only: a signature added later would cover the image with its own
+//! bytes excluded (image start to `sig`, then past `sig` to `image_len`)
+//! under SHA-256, leaving the CRCs as a cheap pre-check.
 
-#[derive(bytemuck::AnyBitPattern, Clone, Copy)]
+/// Stored at [`MANIFEST_OFFSET`] inside the application image
+#[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy)]
 #[repr(C)]
-/// Stored at [`crate::consts::MANIFEST_OFFSET`] inside the application image
 pub struct AppManifest {
     pub head: ManifestHeader,
     pub body: ManifestBody,
@@ -34,36 +32,43 @@ pub struct AppManifest {
 /// they cover the whole image except these eight bytes. `crc32_vec_table`
 /// covers the vector table below the manifest (image start up to `head`);
 /// `crc32_image` covers `body` through the end of the image (`image_len`).
-#[derive(bytemuck::AnyBitPattern, Clone, Copy)]
+#[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy)]
 #[repr(C)]
 pub struct ManifestHeader {
     pub crc32_vec_table: u32,
     pub crc32_image: u32,
 }
 
-#[derive(bytemuck::AnyBitPattern, Clone, Copy)]
+/// The part of the manifest `crc32_image` covers. New fields are append
+/// only: a BOOT built today reads the fields it knows from a manifest an
+/// application writes later.
+#[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy)]
 #[repr(C)]
-/// ABI: new fields are APPEND ONLY, as this leaves us backwards-compatible.
 pub struct ManifestBody {
-    /// Selects the signing key among those baked into BOOT; 0 when unsigned.
+    /// Selects the signing key among those baked into BOOT; 0 when unsigned
     pub pubkey_id: u64,
     pub magic: u32,
-    /// Word-aligned; bounds `crc32_image` and is range-checked in `Boot::verify`.
+    /// Word-aligned; bounds `crc32_image` and is range-checked in
+    /// `Boot::verify`
     pub image_len: u32,
-    /// Anti-rollback counter (reserved for v2).
+    /// Anti-rollback counter (reserved for v2)
     pub version: u16,
-    /// BOOT refuses an image below [`FMT_VER`].
+    /// Layout this manifest was stamped with. BOOT refuses an image below
+    /// its own [`FMT_VER`]; see the module docs for what that costs.
     pub fmt_version: u16,
-    /// [`SigScheme`] as a raw byte; read it typed with [`ManifestBody::scheme`].
+    /// [`SigScheme`] as a raw byte; read it typed with
+    /// [`ManifestBody::scheme`]
     pub sig_scheme: u8,
-    /// Must be 0: keeps the signed region free of implicit padding.
+    /// Pads the body so it carries no implicit padding bytes. [`stamp`]
+    /// zeroes it; nothing on-target checks it.
     pub reserved: [u8; 3],
-    /// Detached signature; covers the image with its own bytes excluded.
+    /// Reserved for a detached signature, sized for an ECDSA P-256 `r || s`.
+    /// [`stamp`] fills it with `0xFF` and nothing reads it.
     pub sig: [u8; 64],
 }
 
 impl ManifestBody {
-    /// Typed view of [`sig_scheme`](Self::sig_scheme).
+    /// Typed view of [`sig_scheme`](Self::sig_scheme)
     pub const fn scheme(&self) -> Option<SigScheme> {
         SigScheme::from_u8(self.sig_scheme)
     }
@@ -80,8 +85,11 @@ pub enum SigScheme {
 }
 
 impl SigScheme {
-    /// Decode a stored [`ManifestBody::sig_scheme`] byte. `None` is a scheme
-    /// this build does not know, which an old BOOT must treat as unverifiable.
+    /// Decode a stored [`ManifestBody::sig_scheme`] byte
+    ///
+    /// `None` is a scheme this build does not know. Nothing decodes the byte
+    /// today: `Boot::verify` does not look at it, so an unknown scheme is
+    /// not by itself a reason an image is refused.
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Unsigned),
@@ -91,21 +99,23 @@ impl SigScheme {
     }
 }
 
-/// Manifest magic ([`ManifestBody::magic`]); the first check in verification.
+/// Manifest magic ([`ManifestBody::magic`]); the first check in verification
 pub const MAGIC: u32 = 0xa55af00b;
-/// Current manifest layout version ([`ManifestBody::fmt_version`]).
+/// Lowest manifest layout a bootloader built from this source accepts
+/// ([`ManifestBody::fmt_version`])
 pub const FMT_VER: u16 = 1;
 
 // Weak-frozen layout: pin the size and the signed-region split point so a
 // field reshuffle cannot silently move them. `sig` at body offset 24 keeps
-// the struct 96 bytes with no implicit padding.
+// `AppManifest` at 96 bytes with no implicit padding.
 const _: () = assert!(size_of::<AppManifest>() == 96);
 const _: () = assert!(core::mem::offset_of!(ManifestBody, sig) == 24);
 
 impl AppManifest {
     /// An unsigned, unstamped manifest to reserve the slot with
-    /// [`install_manifest!`](crate::install_manifest); the post-link tool
-    /// fills the length, CRCs, and (when signing) the signature.
+    /// [`install_manifest!`](crate::install_manifest). [`stamp`] fills in
+    /// the length, the version and the CRCs after linking;
+    /// `samd5-boot-tools` is what calls it.
     pub const fn placeholder() -> Self {
         Self {
             head: ManifestHeader {
@@ -151,7 +161,7 @@ use core::mem::offset_of;
 const OFF_CRC_VEC: usize = MANIFEST_OFFSET + offset_of!(AppManifest, head.crc32_vec_table);
 const OFF_CRC_IMG: usize = MANIFEST_OFFSET + offset_of!(AppManifest, head.crc32_image);
 /// Start of the `crc32_image` range: the body, i.e. everything past the two
-/// CRC fields that cannot cover themselves.
+/// CRC fields that cannot cover themselves
 pub const OFF_BODY: usize = MANIFEST_OFFSET + offset_of!(AppManifest, body);
 const OFF_PUBKEY: usize = MANIFEST_OFFSET + offset_of!(AppManifest, body.pubkey_id);
 const OFF_MAGIC: usize = MANIFEST_OFFSET + offset_of!(AppManifest, body.magic);
@@ -162,20 +172,22 @@ const OFF_SIG_SCHEME: usize = MANIFEST_OFFSET + offset_of!(AppManifest, body.sig
 const OFF_RESERVED: usize = MANIFEST_OFFSET + offset_of!(AppManifest, body.reserved);
 const OFF_SIG: usize = MANIFEST_OFFSET + offset_of!(AppManifest, body.sig);
 
-/// Smallest image a manifest fits in: the slot must exist entirely.
-/// Mirrors the floor `check_slot` enforces on `image_len`; the ceiling is a
-/// runtime value (chip density and SmartEEPROM reserve) and is checked there.
+/// Smallest image a manifest fits in: the slot must be wholly present.
+/// This is the floor the bootloader applies to `image_len` when it verifies
+/// a slot; the ceiling is a runtime value (chip density and the live
+/// SmartEEPROM reserve) and is checked there.
 pub const MIN_IMAGE_LEN: usize = MANIFEST_OFFSET + size_of::<AppManifest>();
 
+/// Why [`stamp`] could not stamp an image
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StampError {
-    /// The manifest slot does not fit; `len` is what was offered.
+    /// The manifest slot does not fit; `len` is what was offered
     TooShort { len: usize, need: usize },
-    /// `crc32_image` runs to `image_len`, which the DSU walks in words.
+    /// `crc32_image` runs to `image_len`, which the DSU walks in words
     Unaligned { len: usize },
 }
 
-/// What was written, for a caller that wants to report or re-check it.
+/// What was written, for a caller that wants to report or re-check it
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamped {
     pub image_len: u32,
@@ -184,12 +196,24 @@ pub struct Stamped {
     pub crc32_image: u32,
 }
 
-/// Stamp a valid unsigned v1 manifest into a linked image, in place.
+/// Stamp a valid unsigned v1 manifest into a linked image, in place
 ///
-/// `image.len()` becomes `image_len`, so the caller pads to a word boundary
-/// first if it wants to. Order matters: every body field is written before
-/// `crc32_image` is taken over the body range, and the head CRCs go last
-/// because nothing may change underneath them.
+/// `image` must be an application image linked with `samd5_boot_app.x`: the
+/// offsets are fixed, so stamping an image with no manifest slot overwrites
+/// whatever is at [`MANIFEST_OFFSET`] instead.
+///
+/// `image.len()` becomes `image_len`, so the caller pads the image to its
+/// final length first; a length that is not a multiple of 4 is rejected.
+/// Order matters: every body field is written before `crc32_image` is taken
+/// over the body range, and the head CRCs go last because nothing may change
+/// underneath them.
+///
+/// # Errors
+///
+/// * Returns [`StampError::TooShort`] if `image` is smaller than
+///   [`MIN_IMAGE_LEN`], so the manifest slot is not wholly present.
+/// * Returns [`StampError::Unaligned`] if `image.len()` is not a multiple
+///   of 4.
 pub fn stamp(image: &mut [u8], version: u16) -> Result<Stamped, StampError> {
     let len = image.len();
     if len < MIN_IMAGE_LEN {
@@ -227,8 +251,11 @@ pub fn stamp(image: &mut [u8], version: u16) -> Result<Stamped, StampError> {
 }
 
 /// The version a stamped image carries, or `None` if it holds no manifest
-/// this BOOT would accept. Lets a host read an image's identity out of the
-/// image rather than being told it separately.
+/// with a recognised [`MAGIC`] and an [`FMT_VER`] this build can read
+///
+/// This is an identity check, not a verification: `image_len` and the two
+/// CRCs are not looked at, so an image that reads a version here can still
+/// fail on-target.
 pub fn read_version(image: &[u8]) -> Option<u16> {
     if image.len() < MIN_IMAGE_LEN {
         return None;

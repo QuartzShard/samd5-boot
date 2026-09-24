@@ -2,8 +2,8 @@
 //! samd5-boot download-mode stress rig on the ATSAMD51J20A.
 //!
 //! Three pins, and this crate touches no others: PB02 = TxD, PB03 = RxD (both
-//! peripheral function D = SERCOM5 PAD[0] and PAD[1]), PB00 = the RS485 driver
-//! enable, held as a plain GPIO output.
+//! peripheral function D = SERCOM5 `PAD[0]` and `PAD[1]`), PB00 = the RS485
+//! driver enable, held as a plain GPIO output.
 //!
 //! # Clock: GCLK generator 0, DFLL48M open loop, 48 MHz
 //!
@@ -33,7 +33,7 @@
 //!
 //! # Transmit enable: plain GPIO on PB00, released on TXC
 //!
-//! PB00's function D really is SERCOM5 PAD[2], the RTS/TE pad, so the SERCOM
+//! PB00's function D really is SERCOM5 `PAD[2]`, the RTS/TE pad, so the SERCOM
 //! could drive it itself (DS 34.6.3.6: `CTRLA.FORM` = 0x0 with
 //! `CTRLA.TXPO` = 0x3 puts the part in RS485 mode, holds TE through the stop
 //! bits, and adds `CTRLC.GTIME` guard time). This crate drives PB00 by hand
@@ -50,7 +50,7 @@
 //!
 //! # Why the PAC and not the HAL's UART
 //!
-//! `atsamd-hal`'s pad filter rejects RX on PAD[1] together with `TXPO` = 0x0
+//! `atsamd-hal`'s pad filter rejects RX on `PAD[1]` together with `TXPO` = 0x0
 //! (`sercom/uart/pads_thumbv7em.rs`, "RX can't be Pad1 if TXPO is 0 because of
 //! XCK conflict"), which is exactly the wiring here. The filter is
 //! conservative: `TXPO` only assigns XCK "when applicable" (DS Table 34-2),
@@ -317,9 +317,11 @@ impl Serial {
     /// Report and reset whether any framing, parity, or overflow error has been
     /// seen since the last call.
     ///
-    /// Overflow is the one to watch on this rig: the receive FIFO is two deep,
-    /// and a caller that stalls for more than ~170 us at 115200 (an NVMCTRL
-    /// page write, say) drops bytes out of the middle of an image stream.
+    /// Overflow is the one to watch on this rig. The `SERCOM5_2` handler keeps
+    /// the two-deep receive FIFO drained into [`RX_RING`], so a byte is lost
+    /// only while that interrupt is masked (the length of a
+    /// [`write_all`](Self::write_all) burst) or once the ring itself fills,
+    /// which takes about 700 ms of unread line rate.
     pub fn take_rx_error(&mut self) -> bool {
         RX_LOST.swap(false, Ordering::Relaxed)
     }

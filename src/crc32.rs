@@ -1,26 +1,26 @@
-//! CRC-32/ISO-HDLC (zlib crc32), matching the SAMD5x DSU CRC engine.
+//! CRC-32/ISO-HDLC (zlib crc32), the convention the SAMD5x DSU computes
 //!
-//! BOOT verifies an image with the DSU, and host tooling stamps the manifest
-//! with this, so the two have to agree byte for byte. Keeping the convention
-//! here, next to the manifest that carries it, is what makes that checkable:
-//! the vectors below pin it.
-//!
-//! [`crate::persist::BootStore`] seals itself with the same convention but a
-//! table-free loop, which keeps this table out of BOOT: BOOT verifies images
-//! with the DSU and never links this, so its whole .rodata stays a few
-//! hundred bytes. That only holds while BOOT is built for size; at opt-level
-//! 3 LLVM's CRC loop-idiom pass rebuilds a 1 KiB table from the loop.
+//! [`crc32`] is the whole module. Host tooling stamps the manifest with it
+//! and BOOT verifies the same bytes with the DSU, so the two must agree byte
+//! for byte; the test vectors below pin that.
 //!
 //! Parameters: width 32, poly 0x04C11DB7, init 0xFFFFFFFF, refin = true,
-//! refout = true, xorout = 0xFFFFFFFF. Because input and output are reflected,
-//! the implementation uses the bit-reversed poly 0xEDB88320 and processes each
-//! byte LSB-first, which is the standard byte-at-a-time reflected form. The DSU
-//! walks memory in ascending-address order; feeding the same bytes in the same
-//! order reproduces its result exactly.
+//! refout = true, xorout = 0xFFFFFFFF. Because input and output are
+//! reflected, the implementation uses the bit-reversed poly 0xEDB88320 and
+//! processes each byte LSB-first, which is the standard byte-at-a-time
+//! reflected form. The DSU walks memory in ascending-address order; feeding
+//! the same bytes in the same order reproduces its result exactly. The hal
+//! complements the DSU's `DATA` register, so `Dsu::crc32` returns this same
+//! value.
+//!
+//! [`crate::persist::BootStore`] seals itself with the same convention but a
+//! table-free loop, so a BOOT that never calls [`crc32`] does not link the
+//! 1 KiB table. That holds only while BOOT is built for size: at opt-level 3
+//! LLVM's CRC loop-idiom pass rebuilds the table from the loop.
 
 const POLY_REFLECTED: u32 = 0xEDB8_8320;
 
-/// Byte-wise lookup table for the reflected polynomial, built at compile time.
+/// Byte-wise lookup table for the reflected polynomial, built at compile time
 const TABLE: [u32; 256] = {
     let mut table = [0u32; 256];
     let mut n = 0usize;
@@ -41,7 +41,7 @@ const TABLE: [u32; 256] = {
     table
 };
 
-/// zlib crc32 of `data`.
+/// Compute the CRC-32 of `data`
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {

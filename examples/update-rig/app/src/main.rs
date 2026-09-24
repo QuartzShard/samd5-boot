@@ -1,5 +1,5 @@
-//! The application image for the RS485 update rig: the payload BOOT
-//! installs, swaps into, and boots. APP role, so its `memory.x` selects
+//! The application image for the update rig: the payload BOOT installs,
+//! swaps into, and boots. APP role, so its `memory.x` selects
 //! `samd5_boot_app.x` and it reserves a manifest slot with
 //! [`install_manifest!`]; the manifest tool stamps the length and CRCs into
 //! that slot after linking, which is what makes the image verify.
@@ -17,8 +17,9 @@
 //! Building with `--features noconfirm` skips that call, which is how the
 //! rig exercises the auto-revert path.
 //!
-//! The link's baud divisor assumes GCLK generator 0 is still the reset
-//! DFLL48M at 48 MHz; deliberately nothing here reconfigures the clock tree.
+//! Under `--features rs485` the link's baud divisor assumes GCLK generator 0
+//! is still the reset DFLL48M at 48 MHz; deliberately nothing here
+//! reconfigures the clock tree.
 
 #![no_std]
 #![no_main]

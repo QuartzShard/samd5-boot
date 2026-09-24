@@ -10,6 +10,8 @@ use serialport::{ClearBuffer, DataBits, FlowControl, Parity, SerialPort, StopBit
 
 use super::Transport;
 
+/// Must match `demo_serial::BAUD_RATE`, which the firmware programs into
+/// SERCOM5. This crate does not depend on `demo-serial`, so it is a copy.
 pub const BAUD: u32 = 115_200;
 
 pub struct Serial {

@@ -1,19 +1,22 @@
-//! Making a linked application image acceptable to the bootloader.
+//! Stamp a linked application image so the bootloader accepts it
 
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use samd5_boot::manifest::{self, Stamped};
 
-/// Stamp the manifest of a linked image, in place in `output`.
+/// Stamp a manifest into a linked image, reading `input` and writing the
+/// result to `output`
 ///
-/// The application reserves the slot with `install_manifest!`; this fills in
-/// the length and the two CRCs the bootloader verifies against, using the
-/// same code and offsets it reads them back with. An image that has not been
-/// through this will not verify.
+/// The application reserves the slot with
+/// [`samd5_boot::install_manifest!`]; this writes the whole unsigned v1
+/// manifest through [`samd5_boot::manifest::stamp`] (magic, `image_len`,
+/// `version`, `fmt_version`, the unsigned signature scheme, and the two
+/// CRCs BOOT checks), using the same code and offsets BOOT reads them back
+/// with. An image that has not been through this will not verify.
 ///
-/// The image is padded to a whole number of words first, because `image_len`
-/// bounds a CRC the DSU walks in words.
+/// The image is padded with `0xFF` to a whole number of words first,
+/// because `image_len` bounds a CRC the DSU walks in words.
 pub fn stamp(input: &Path, output: &Path, version: u16) -> Result<Stamped> {
     let mut image = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     while !image.len().is_multiple_of(4) {

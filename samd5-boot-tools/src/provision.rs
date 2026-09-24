@@ -1,14 +1,14 @@
 //! Fuse provisioning: the user-page write that decides what BOOTPROT
-//! protects and which flash regions are locked.
+//! protects and which flash regions are locked
 //!
 //! The page is one erase-and-rewrite unit, so every field in it is read,
 //! patched and written back together. Fields not named on the command line
 //! are preserved word for word, which matters because the page also carries
 //! the BOD levels, the watchdog fuses and the SmartEEPROM configuration.
 //!
-//! Field positions come from the hal's `RawUserpage` and DS60001507 Table
-//! 25-6: BOOTPROT at bits 29:26, SEE SBLK at 35:32, SEE PSZ at 38:36, and
-//! NVM LOCKS at 95:64 where a *clear* bit locks the region.
+//! Field positions come from the hal's `RawUserpage` and the NVM User Page
+//! Mapping table in DS60001507 section 25: BOOTPROT at bits 29:26, SEE SBLK
+//! at 35:32, and NVM LOCKS at 95:64, where a *clear* bit locks the region.
 //!
 //! # The erase window
 //!
@@ -30,8 +30,10 @@ use crate::probe::{Cmd, Device, Mode, Nvm};
 const PAGE_WORDS: usize = USER_PAGE_SIZE / 4;
 const QUAD_WORDS: usize = WRITE_UNIT / 4;
 
-/// The page as stored, with accessors for the fields this tool touches.
-/// Held as words because that is the only width NVM accepts.
+/// The user page as stored, with accessors for the fields this tool touches
+///
+/// Held as words because the page buffer takes word-wide writes and nothing
+/// narrower (see [`Nvm::fill`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct UserPage([u32; PAGE_WORDS]);
 
@@ -52,7 +54,7 @@ impl UserPage {
         self.0[1] = (self.0[1] & !0xF) | (blocks as u32 & 0xF);
     }
 
-    /// One bit per flash region; a clear bit locks that region.
+    /// One bit per flash region; a clear bit locks that region
     pub fn locks(&self) -> u32 {
         self.0[2]
     }
@@ -86,12 +88,13 @@ impl UserPage {
     }
 
     /// Where this page first differs from another, for reporting a failed
-    /// verification as something specific rather than "differs".
+    /// verification as something specific rather than "differs"
     fn first_difference(&self, other: &Self) -> Option<usize> {
         self.0.iter().zip(&other.0).position(|(a, b)| a != b)
     }
 }
 
+/// Read the user page with the NVM cache disabled
 pub fn read_page(nvm: &mut Nvm<'_>) -> Result<UserPage> {
     nvm.uncached(|nvm| {
         let mut words = [0u32; PAGE_WORDS];
@@ -100,13 +103,13 @@ pub fn read_page(nvm: &mut Nvm<'_>) -> Result<UserPage> {
     })
 }
 
-/// Erase the user page and write `page` back into it.
+/// Erase the user page and write `page` back into it
 ///
 /// The erase and every quad-word commit happen against one halted core
 /// inside one attach, so the volatile page buffer survives from fill to
 /// commit and nothing else is driving NVMCTRL in between. Errata 2.14.1
 /// also wants the NVM cache off across a programming operation, which is
-/// what `uncached` gives here.
+/// what [`Nvm::uncached`] gives here.
 fn write_page(nvm: &mut Nvm<'_>, page: &UserPage) -> Result<()> {
     nvm.uncached(|nvm| {
         nvm.set_addr(USER_PAGE_ADDR as u32)?;
@@ -132,17 +135,37 @@ fn write_page(nvm: &mut Nvm<'_>, page: &UserPage) -> Result<()> {
     })
 }
 
+/// The fuse settings [`run`] computes a page from
 pub struct Fuses {
+    /// BOOT region size in bytes. Must satisfy
+    /// [`geometry::boot_size_valid`] for the part's flash density.
     pub boot_size: usize,
+    /// Lock the BOOT regions of both banks, so neither copy can be erased
+    /// or written after reset.
     pub lock_boot: bool,
+    /// SmartEEPROM blocks, 0..=10. `None` leaves the field as it is.
     pub see_sblk: Option<u8>,
 }
 
+/// What [`run`] writes: a page computed from [`Fuses`], or a saved page put
+/// back word for word
 pub enum Request {
     Fuses(Fuses),
     Restore(PathBuf),
 }
 
+/// Provision one part: read the user page, plan the change, write it, and
+/// check it survived a reset
+///
+/// The page is read first, so `req` is applied to what the part actually
+/// holds, and a page that already holds the result is left untouched. The
+/// previous contents are saved under `backup_dir` before the erase, unless
+/// the page was blank or a backup is already there. After the write the part
+/// is reset so NVMCTRL re-latches the fuses, and `STATUS.BOOTPROT` and
+/// `RUNLOCK` are compared against what was asked for.
+///
+/// In [`Mode::DryRun`] the plan is printed and nothing is backed up or
+/// written.
 pub fn run(chip: &str, req: Request, backup_dir: &Path, mode: Mode) -> Result<()> {
     let mut device = Device::attach(chip, mode)?;
     let mut nvm = device.halted()?;
@@ -238,7 +261,7 @@ pub fn run(chip: &str, req: Request, backup_dir: &Path, mode: Mode) -> Result<()
     Ok(())
 }
 
-/// What the requested options make of the page that is there now.
+/// What the requested options make of the page that is there now
 fn plan(before: &UserPage, req: &Fuses, flash_size: usize) -> Result<UserPage> {
     if !geometry::boot_size_valid(flash_size, req.boot_size) {
         bail!(
@@ -289,8 +312,10 @@ fn plan(before: &UserPage, req: &Fuses, flash_size: usize) -> Result<UserPage> {
     Ok(after)
 }
 
-/// Check the write landed, then reset so NVMCTRL re-latches the fuses. The
-/// caller is what compares the latched values against STATUS and RUNLOCK.
+/// Check the write landed, then reset so NVMCTRL re-latches the fuses
+///
+/// The caller is what compares the latched values against STATUS and
+/// RUNLOCK.
 fn verify(nvm: &mut Nvm<'_>, want: &UserPage) -> Result<()> {
     let stored = read_page(nvm)?;
     if let Some(w) = stored.first_difference(want) {
@@ -317,8 +342,10 @@ fn verify(nvm: &mut Nvm<'_>, want: &UserPage) -> Result<()> {
     Ok(())
 }
 
-/// Keep the pre-erase contents, once. A second failed run must not overwrite
-/// the good capture with the blank page the first one left behind.
+/// Keep the pre-erase contents, once
+///
+/// A second failed run must not overwrite the good capture with the blank
+/// page the first one left behind.
 ///
 /// `None` means no file holds the previous contents, because a blank page has
 /// none worth keeping.
@@ -339,7 +366,7 @@ fn save_backup(dir: &Path, chip: &str, page: &UserPage) -> Result<Option<PathBuf
 }
 
 /// Read-only report, for finding out what a part is actually configured as
-/// before changing anything.
+/// before changing anything
 pub fn info(chip: &str) -> Result<()> {
     let mut device = Device::attach(chip, Mode::Run)?;
     let mut nvm = device.halted()?;
@@ -369,7 +396,7 @@ pub fn info(chip: &str) -> Result<()> {
 }
 
 /// Set the update request through the debugger, so BOOT waits for an image
-/// instead of booting the application.
+/// instead of booting the application
 ///
 /// The application is what normally sets this flag before resetting, so an
 /// application that cannot be asked (wrong transport, wedged, or absent

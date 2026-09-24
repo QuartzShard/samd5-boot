@@ -1,9 +1,22 @@
-//! Application-side client. What the app running on top of a
-//! samd5-boot image calls to confirm a trial, condemn itself, request an
-//! update, or read the previous boot's outcome. Built over the same
-//! [`BootStorage`] the bootloader uses, so the application constructs a
-//! [`SmartEepromStore`](crate::persist::SmartEepromStore) at the same
-//! offset and hands it here.
+//! Application-side client for the bootloader's boot record
+//!
+//! The application talks to BOOT through the same [`BootStorage`] the
+//! bootloader keeps its record in: open that store with the same backend and
+//! offset BOOT uses, wrap it with [`BootClient::new`], and then, early in
+//! `main`:
+//!
+//! 1. Call [`BootClient::boot_state`] to read why the bootloader last
+//!    reverted an image, if it ever has.
+//!
+//! 1. Call [`BootClient::confirm`] to mark the running image good and take
+//!    the trial watchdog over. A trial image that never confirms is reverted
+//!    once the attempt budget or the watchdog runs out, so this must land
+//!    before the [`trial_timeout`](crate::boot::BootConfig::trial_timeout)
+//!    BOOT armed expires.
+//!
+//! Afterwards [`BootClient::reject`] condemns the running image, and
+//! [`BootClient::request_update`] asks BOOT to enter download mode on the
+//! next boot. Every call is a read-modify-write of the boot record.
 
 use atsamd_hal as hal;
 use embedded_hal_02::watchdog::{Watchdog as _, WatchdogDisable, WatchdogEnable};
@@ -14,45 +27,49 @@ use hal::{
 
 use crate::persist::{BootStorage, RevertReason, UpdateMailbox};
 
-/// What [`BootClient::confirm`] did with the watchdog.
+/// What [`BootClient::confirm`] did with the watchdog
 pub enum WdtHandoff {
     Reconfigured,
     Disabled,
-    /// `CTRLA.ALWAYSON` is fused: the watchdog can be neither disabled
-    /// nor reconfigured, only fed. The application is stuck with the
-    /// period BOOT armed.
+    /// `Wdt.CTRLA.ALWAYSON` is set: the watchdog can be neither disabled nor
+    /// reconfigured, only fed. `cfg` was ignored, and the application must go
+    /// on feeding at the period already in force.
     LockedByAlwaysOn,
 }
 
 /// Failure of a mailbox update, which reads the record before writing the
-/// amended one back.
+/// amended one back
 pub enum ClientError<R, W> {
     Read(R),
     Write(W),
 }
 
-/// The previous boot's outcome, for upstream reporting.
+/// The last rollback the bootloader recorded, for upstream reporting
 pub struct BootOutcome {
-    /// Why the bootloader reverted an image on the way here, if it did.
-    /// `None` is also what an unrecognised code reads as, which is what a
-    /// record written by a newer BOOT looks like.
+    /// Why the bootloader last reverted an image, if it ever has. The code
+    /// is sticky: [`revert`](crate::boot::Boot::revert) writes it and only a
+    /// promotion clears it, so a steady boot long after a rollback still
+    /// reports the same reason. `None` is also what an unrecognised code
+    /// reads as, which is what a record written by a newer BOOT looks like.
     pub revert_reason: Option<RevertReason>,
 }
 
 /// The application-side handle over the shared [`BootStorage`]: the
-/// confirm/reject/update mailbox and the last boot's outcome.
+/// confirm/reject/update mailbox and the last boot's outcome
 pub struct BootClient<St> {
     store: St,
 }
 
 impl<St: BootStorage> BootClient<St> {
-    /// Wrap a store the application already opened (at the bootloader's
-    /// offset).
+    /// Wrap a store the application already opened
+    ///
+    /// It must be the same backend, at the same offset, the bootloader keeps
+    /// its record in, or the two do not see each other's writes.
     pub fn new(store: St) -> Self {
         Self { store }
     }
 
-    /// Recover the wrapped store.
+    /// Recover the wrapped store
     pub fn free(self) -> St {
         self.store
     }
@@ -66,7 +83,7 @@ impl<St: BootStorage> BootClient<St> {
         self.store.write(record).map_err(ClientError::Write)
     }
 
-    /// Read what the bootloader recorded on the way to this boot.
+    /// Read what the bootloader recorded on the way to this boot
     pub fn boot_state(&mut self) -> Result<BootOutcome, St::ReadErr> {
         let record = self.store.read()?;
         Ok(BootOutcome {
@@ -74,13 +91,16 @@ impl<St: BootStorage> BootClient<St> {
         })
     }
 
-    /// Call early in init. Marks the running image good, so the
-    /// bootloader promotes it on the next boot, and hands the trial
-    /// watchdog to the application: feeds it, then applies `cfg` (or
-    /// disables it when `None`). Writing the confirm flag comes before
-    /// the watchdog is touched, so a fault during the changeover still
-    /// has the fed watchdog covering it. See [`WdtHandoff`] for the
-    /// ALWAYSON case.
+    /// Mark the running image good and take the trial watchdog over
+    ///
+    /// Call it early in init. The bootloader promotes the image on the next
+    /// boot. The watchdog is fed first and the confirm flag written before
+    /// it is reconfigured, so a fault during the changeover is still covered
+    /// by a freshly fed watchdog; `cfg` is then applied, or the watchdog
+    /// disabled when it is `None`. See [`WdtHandoff`] for the ALWAYSON case.
+    ///
+    /// On an error the watchdog is left as the bootloader armed it, fed but
+    /// still on the trial period, and the caller must go on feeding it.
     pub fn confirm(
         &mut self,
         wdt: &mut Watchdog,
@@ -112,7 +132,7 @@ impl<St: BootStorage> BootClient<St> {
         self.set_flag(|mailbox| mailbox.set_rejected(true))
     }
 
-    /// Ask the bootloader to enter download mode on the next boot.
+    /// Ask the bootloader to enter download mode on the next boot
     pub fn request_update(&mut self) -> Result<(), ClientError<St::ReadErr, St::WriteErr>> {
         self.set_flag(|mailbox| mailbox.set_request_update(true))
     }

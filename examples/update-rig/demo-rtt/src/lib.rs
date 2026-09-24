@@ -16,14 +16,13 @@
 //! Here the buffer *is* the transport. The host writes into a ring in RAM
 //! and the target drains it whenever it gets around to it; if the ring fills,
 //! the host's write reports a short count and it tries again. Nothing is
-//! lost because nothing was ever in flight. The same property makes the
-//! stream survive the bootloader disabling interrupts, since no interrupt is
-//! involved on this side.
+//! lost because nothing was ever in flight.
 //!
 //! # Channels
 //!
-//! Channel 0 up is left to `rtt_init_print!` for log output, so `rprintln!`
-//! keeps working. The protocol gets channel 1 up and channel 0 down, named
+//! Channel 0 up is the log channel, named `Terminal` and set as the
+//! `rprintln!` sink, exactly what `rtt_init_print!` would have built. The
+//! protocol gets channel 1 up and channel 0 down, both named `samd5-boot`
 //! so the host can confirm it attached to the block it meant to.
 
 #![no_std]
@@ -36,9 +35,9 @@ pub use demo_rig::{CORE_CLOCK_HZ, STORE_OFFSET};
 /// visible without reading the features it was compiled with.
 pub const NAME: &str = "RTT";
 
-/// Host to target: a control frame, or the raw body of an image. Sized so a
-/// whole flash page plus framing is in flight while the target is busy in an
-/// erase, which is the longest it ever stops reading.
+/// Host to target: a control frame, or the raw body of an image. Eight flash
+/// pages deep, so the host can keep writing while the target is busy in a
+/// page program or a 16-page block erase.
 pub const RX_RING: usize = 4096;
 /// Target to host: only ever control frames, which are tens of bytes.
 pub const TX_RING: usize = 1024;
@@ -140,7 +139,7 @@ impl Link {
 ///
 /// `rtt_init!` places it wherever the linker chose, which differs between
 /// BOOT and the application, so the host has to be told rather than left to
-/// search. See [`demo_rig::RTT_POINTER_ADDR`] for why the slot lives in
+/// search. See [`demo_rig::RTT_POINTER_OFFSET`] for why the slot lives in
 /// backup RAM.
 fn publish_control_block() {
     // SAFETY: `rtt_init!` above exported this symbol, and the slot is ours

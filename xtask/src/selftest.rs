@@ -1,11 +1,8 @@
-//! The rig's self-test: drives every samd5-boot call path over the link and
-//! reports one PASS/FAIL line per path.
-//!
-//! Two application images are needed. The normal build confirms itself on
-//! boot (so it is promoted out of trial); the `noconfirm` build never does,
-//! which is what lets the rollback paths be exercised. They report different
-//! `app_version` values, so the host can always tell which one a device came
-//! back running.
+//! The rig's self-test: drives the bootloader's update paths over the link
+//! and prints one PASS/FAIL line per check. [`run`] is the whole suite, in
+//! order and against one device: install, verify-and-reject, trial, both
+//! rollbacks, and the application-requested update window. Each check
+//! starts from the state the one before it left.
 
 use std::fs;
 use std::path::Path;
@@ -18,7 +15,7 @@ use samd5_boot::{manifest, persist::RevertReason};
 use crate::image;
 use crate::link::{Link, Transport};
 
-/// Long enough for a swap, BOOT's update window, and the app coming up.
+/// Long enough for a reset, BOOT's verify, and the app coming up.
 const APP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A rejected install answers quickly; a successful one never answers.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -129,6 +126,12 @@ fn plain_reset<T: Transport>(link: &mut Link<T>) -> Result<()> {
 /// race: the only thing to establish is that the application is no longer
 /// the one answering. `GetState` is answered by the application alone,
 /// which makes its silence the signal.
+///
+/// It can take two resets. When the running image has just confirmed a
+/// trial, the next boot is the promotion, which outranks the update
+/// request in `Boot::disposition` and boots the application again with the
+/// request still pending; the trial watchdog it re-armed in `confirm`
+/// supplies the second reset. Hence the 20 s deadline.
 fn wait_for_boot<T: Transport>(link: &mut Link<T>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
@@ -160,13 +163,20 @@ fn install_and_wait<T: Transport>(link: &mut Link<T>, image: &[u8]) -> Result<Ap
     wait_for_app(link, APP_TIMEOUT)
 }
 
+/// Run every check against the device on `link`, returning whether they all
+/// passed.
+///
+/// `good` is the confirming build and `noconfirm` the one that never
+/// confirms. Both must be stamped, and with different versions, or the
+/// rollback checks cannot tell which image answered.
 pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> Result<bool> {
     let good_image = fs::read(good).with_context(|| good.display().to_string())?;
     let noconfirm_image = fs::read(noconfirm).with_context(|| noconfirm.display().to_string())?;
 
-    // Each image announces its own version on the wire, and it is stamped
-    // into the manifest the device verifies, so read it from the file rather
-    // than restating what the app crate was built with.
+    // Each image reports a version on the wire from its own `APP_VERSION`
+    // const, and `xtask build` stamps the matching value into the manifest,
+    // so read it from the file rather than restating it here. The two
+    // definitions have to agree for these comparisons to mean anything.
     let good_version = image_version(&good_image, good)?;
     let noconfirm_version = image_version(&noconfirm_image, noconfirm)?;
     if good_version == noconfirm_version {
@@ -182,7 +192,7 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
     };
     println!("running the rig self-test, this takes about a minute\n");
 
-    // The link itself, and BOOT's own liveness during the update window.
+    // The link itself: whichever of BOOT and the application is up answers.
     r.check(
         "link: Ping is answered",
         (|| {
@@ -195,8 +205,8 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
         })(),
     );
 
-    // Install, verify, swap, boot: the whole happy path, ending in an image
-    // that confirms itself and so leaves trial.
+    // Install, verify, swap, boot: the happy path, ending in an image that
+    // has confirmed itself, which promotes it out of trial on its next boot.
     let baseline = install_and_wait(link, &good_image);
     r.check(
         "install: a good image is accepted, booted, and confirms itself",
@@ -240,7 +250,7 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
 
     // An image that never confirms stays on trial.
     r.check(
-        "trial: an unconfirmed image boots and reports itself untrusted",
+        "trial: an unconfirmed image boots and reports confirmed=false",
         install_and_wait(link, &noconfirm_image).and_then(|s| {
             if s.version != noconfirm_version {
                 bail!("came back running version {}", s.version)
@@ -278,7 +288,8 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
             if trial.version != noconfirm_version {
                 bail!("trial image did not boot, saw {}", trial.version);
             }
-            // Each reset spends one attempt; BOOT reverts past the budget.
+            // Each reset spends one attempt; the demo BOOT allows 3, then
+            // reverts.
             for _ in 0..6 {
                 if plain_reset(link).is_err() {
                     break;
@@ -297,7 +308,7 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
         })(),
     );
 
-    // Back to a clean, confirmed baseline, which also re-exercises the
+    // Back to the confirming image, which re-exercises the
     // application-requested update window.
     r.check(
         "window: an application-requested reboot accepts a new image",

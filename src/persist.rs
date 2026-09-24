@@ -1,5 +1,13 @@
-//! Persistent bootloader storage. Used for counting boot trials, anti-rollback, etc
-//! Includes the layout of stored data, and a trait to implement to provide a backend.
+//! Persistent boot record and the backend trait that stores it
+//!
+//! [`BootStore`] is the record: trial bookkeeping ([`BootState`]), the
+//! application-to-BOOT mailbox ([`UpdateMailbox`]), and an anti-rollback
+//! watermark ([`Rollback`]) that nothing reads yet. Implement
+//! [`BootStorage`] to back it, or take one of the backends here:
+//! `SmartEepromStore` (non-volatile), `BkupRamStore` (survives every reset
+//! but not a power cut), [`Fallback`] (one covering for the other) and
+//! [`NoStore`] (no persistence at all). The first two need the `target`
+//! feature.
 //!
 //! Every sub-struct of [`BootStore`] is exactly one 32-bit word: the unit a
 //! backend must write power-atomically. The record carries a checksum over
@@ -8,6 +16,10 @@
 //! trusted. That matters because "unwritten" is not zeros everywhere: an
 //! erased SmartEEPROM region reads as 0xFF, which would otherwise decode as
 //! every mailbox flag set and a spent trial budget.
+//!
+//! A record that fails that check reads as a fresh chip, not as the previous
+//! record: a trial in progress is forgotten and the image that was on trial
+//! boots as a steady image.
 
 #[cfg(feature = "target")]
 use core::convert::Infallible;
@@ -35,22 +47,53 @@ const _: () = assert!(
 const _: () = assert!(size_of::<BootStore>() == 16);
 
 impl BootStore {
-    /// Bytes the checksum covers: everything ahead of it.
+    /// Layout of the stored record, written into every sealed record and
+    /// required of every record read back.
+    ///
+    /// The checksum cannot carry this: it covers whatever sixteen bytes are
+    /// there and so validates an old record read under a new layout just as
+    /// happily. A bootloader can be replaced in the field while a record
+    /// outlives it in backup RAM or SmartEEPROM, and the record is what
+    /// decides which bank boots, so reading one under the wrong layout is
+    /// not a tolerable failure.
+    ///
+    /// Bump it only for a change an older reader cannot survive. Additions
+    /// that an older reader can ignore (a new mailbox flag, the reserved
+    /// fields, the spare bits of `states`) leave it alone, which is what
+    /// keeps a bootloader able to read records written by newer ones.
+    pub const FMT: u8 = 0;
+
+    /// Bytes the checksum covers: everything ahead of it
     const COVERED: usize = size_of::<BootStore>() - size_of::<u32>();
 
     fn computed(&self) -> u32 {
         crc32(&bytemuck::bytes_of(self)[..Self::COVERED])
     }
 
-    /// Stamp the checksum. A backend's `write` does this, so a record on its
-    /// way to storage always carries a current one.
+    /// Stamp the checksum
+    ///
+    /// [`BootStorage::write`] does this, so a record on its way to storage
+    /// always carries a current one. Call it directly only when writing a
+    /// record through something other than that method.
     pub fn seal(&mut self) {
+        self.boot_state.fmt = Self::FMT;
         self.checksum = self.computed();
     }
 
-    /// The record as stored, or `None` if the bytes do not check out.
+    /// The record as stored, or `None` when it is not one this build can act
+    /// on: the bytes do not check out, or they are a layout it does not
+    /// know.
+    ///
+    /// Rejecting an unknown layout is what makes [`BootStore::FMT`] work.
+    /// A reader that ignored the field could not tell a future record from a
+    /// current one, so the check has to be here from the first version
+    /// rather than added alongside the first bump.
+    ///
+    /// [`BootStorage::read`] turns `None` into the fresh default, so the
+    /// outcome is a part that starts over rather than one acting on a record
+    /// it has misread.
     pub fn validated(self) -> Option<Self> {
-        (self.checksum == self.computed()).then_some(self)
+        (self.boot_state.fmt == Self::FMT && self.checksum == self.computed()).then_some(self)
     }
 }
 
@@ -72,19 +115,22 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// Implementation for storing and retrieving `BootStore` from whatever persistent storage you have
-/// in your system - SmartEEPROM backed impl provided.
+/// Backend that stores and retrieves the [`BootStore`] record
+///
+/// Implement it over whatever persistent storage the system has; the
+/// SmartEEPROM and backup RAM backends below are provided.
 ///
 /// # Safety
+///
 /// Each 32-bit word of [`BootStore`] (one sub-struct) must be written
-/// atomically with respect to power loss: a cut mid-`write` may leave
-/// any mix of old and new *words*, never a torn word. No ordering
-/// between words is promised or required.
+/// atomically with respect to power loss: a cut mid-[`write`](Self::write)
+/// may leave any mix of old and new *words*, never a torn word. No
+/// ordering between words is promised or required.
 pub unsafe trait BootStorage {
     type WriteErr;
     type ReadErr;
 
-    /// Hand back the stored bytes as they are, checksum unexamined.
+    /// Hand back the stored bytes as they are, checksum unexamined
     fn read_raw(&mut self) -> Result<BootStore, Self::ReadErr>;
 
     /// Persist the record. Must honour the per-word power-atomicity in the
@@ -93,14 +139,15 @@ pub unsafe trait BootStorage {
     fn write_raw(&mut self, val: BootStore) -> Result<(), Self::WriteErr>;
 
     /// Read the record, falling back to the fresh default when the stored
-    /// bytes do not check out.
+    /// bytes do not check out
     ///
-    /// This is the accessor to use; `read_raw` is the backend's hook.
+    /// This is the accessor to use; [`read_raw`](Self::read_raw) is the
+    /// backend's hook.
     fn read(&mut self) -> Result<BootStore, Self::ReadErr> {
         Ok(self.read_raw()?.validated().unwrap_or_default())
     }
 
-    /// Stamp the checksum and store the record.
+    /// Stamp the checksum and store the record
     fn write(&mut self, mut val: BootStore) -> Result<(), Self::WriteErr> {
         val.seal();
         self.write_raw(val)
@@ -111,16 +158,21 @@ pub unsafe trait BootStorage {
 /// (`STATUS.AFIRST` domain): the record survives BKSWRST while the
 /// slot mapping flips, so resolve which field is active via
 /// `Nvm::first_bank()`.
+///
+/// The per-bank accessors are keyed by the hal's `PhysicalBank`, so they
+/// exist only under the `target` feature.
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy, Default)]
 #[repr(C)]
 pub struct BootState {
-    /// Bank A in bits 1:0, bank B in bits 3:2; 2 bits ↔ 4 variants is
-    /// total, so decode is infallible. Upper bits reserved, preserved.
+    /// Bank A in bits 1:0, bank B in bits 3:2; 2 bits to 4 variants is
+    /// total, so decode is infallible. Bits 7:4 are reserved: a writer
+    /// leaves them as it found them, a reader ignores them.
     states: u8,
     pub boot_count: u8,
-    /// Read it typed with [`BootState::reason`].
+    /// Read it typed with [`BootState::reason`]
     pub revert_reason: u8,
-    reserved: u8,
+    /// Layout of the record these bytes belong to, [`BootStore::FMT`].
+    fmt: u8,
 }
 
 impl BootState {
@@ -135,8 +187,6 @@ impl BootState {
     }
 }
 
-/// Keyed by the hal's `PhysicalBank`, so these are the one part of the
-/// record that a host build cannot have.
 #[cfg(feature = "target")]
 impl BootState {
     const fn shift(bank: &PhysicalBank) -> u8 {
@@ -146,13 +196,13 @@ impl BootState {
         }
     }
 
-    /// The stored [`BankState`] of a physical bank.
+    /// The stored [`BankState`] of a physical bank
     pub fn bank(self, bank: &PhysicalBank) -> BankState {
         BankState::from_bits(self.states >> Self::shift(bank))
     }
 
     /// Overwrite one physical bank's [`BankState`], leaving the other bank's
-    /// bits and the reserved upper bits untouched.
+    /// bits and the reserved upper bits untouched
     pub fn set_bank(&mut self, bank: &PhysicalBank, state: BankState) {
         let shift = Self::shift(bank);
         self.states = (self.states & !(0b11 << shift)) | ((state as u8) << shift);
@@ -173,10 +223,13 @@ impl BootState {
 }
 
 /// State of one bank's image, packed 2 bits per bank in [`BootState`] (never
-/// stored directly). `None` is the all-zeros default, no image or a fresh chip,
-/// bootable in steady state; `New` is an installed image on trial, counted
-/// against the attempt budget until confirmed; `Valid` is a confirmed image;
-/// `Invalid` is condemned and never re-trialed.
+/// stored directly). `None` is the all-zeros default, no image or a fresh
+/// chip, bootable in steady state; `New` is an installed image on trial,
+/// counted against the attempt budget until confirmed; `Valid` is a
+/// confirmed image.
+///
+/// `Invalid` is condemned: the bootloader never boots or re-trials it,
+/// though installing a new image over that bank resets it to `New`.
 #[repr(u8)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum BankState {
@@ -199,11 +252,19 @@ impl BankState {
     }
 }
 
-/// Anti-rollback watermark
+/// Anti-rollback watermark, reserved: nothing in this crate reads or writes
+/// it yet.
+///
+/// The intended contract is the highest
+/// [`version`](crate::manifest::ManifestBody::version) this part
+/// has accepted, so an image that names a lower one can be refused. It is
+/// carried now so adopting it later needs no [`BootStore::FMT`] bump: a
+/// reader of this version leaves the field alone rather than zeroing it.
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Rollback {
     pub highest_seen_manifest: u16,
+    /// Reserved. Writers leave it as they found it, readers ignore it.
     reserved: u16,
 }
 
@@ -213,7 +274,11 @@ pub struct Rollback {
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Clone, Copy, Default)]
 #[repr(C)]
 pub struct UpdateMailbox {
+    /// Bits 2:0 are the three flags below. Bits 7:3 are reserved: a writer
+    /// leaves them as it found them, a reader ignores them, so a flag added
+    /// later costs no [`BootStore::FMT`] bump.
     flags: u8,
+    /// Reserved. Writers leave it as they found it, readers ignore it.
     reserved: [u8; 3],
 }
 
@@ -234,7 +299,8 @@ impl UpdateMailbox {
         }
     }
 
-    /// Enter download mode on the next boot.
+    /// Whether the application asked BOOT to enter download mode on the
+    /// next boot
     pub fn request_update(self) -> bool {
         self.get(Self::REQUEST)
     }
@@ -242,8 +308,8 @@ impl UpdateMailbox {
         self.set(Self::REQUEST, on)
     }
 
-    /// The trial image ran; promote it on the next boot. Only acted on
-    /// while the image is actually on trial.
+    /// Whether the application marked the running image good. BOOT promotes
+    /// it on the next boot, and only while it is still on trial.
     pub fn confirmed(self) -> bool {
         self.get(Self::CONFIRM)
     }
@@ -251,9 +317,9 @@ impl UpdateMailbox {
         self.set(Self::CONFIRM, on)
     }
 
-    /// The application condemned the running image; revert on the next
-    /// boot regardless of which state that image is in. When to set this
-    /// is the application's call.
+    /// Whether the application condemned the running image. BOOT reverts on
+    /// the next boot whatever state that image is in. When to set it is the
+    /// application's call.
     pub fn rejected(self) -> bool {
         self.get(Self::REJECT)
     }
@@ -263,8 +329,9 @@ impl UpdateMailbox {
 }
 
 /// Why the bootloader last abandoned an image, the typed form of the raw
-/// [`BootState::revert_reason`] byte. `None` is the steady state: no
-/// rollback has happened, or a later trial superseded the one that did.
+/// [`BootState::revert_reason`] byte. `None` is the steady state: nothing
+/// has been reverted, or a later trial image was promoted, which is the only
+/// thing that clears the code.
 #[repr(u8)]
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum RevertReason {
@@ -289,9 +356,9 @@ impl RevertReason {
     }
 }
 
-/// [`BootStorage`] for targets without SmartEEPROM: reads zeroed books,
-/// discards writes. Trial bookkeeping is inert; every boot takes the
-/// steady verify-and-jump path.
+/// [`BootStorage`] that persists nothing: reads a zeroed record, discards
+/// writes. Trial bookkeeping is inert; every boot takes the steady
+/// verify-and-jump path.
 pub struct NoStore;
 
 // SAFETY: no writes occur
@@ -313,9 +380,10 @@ unsafe impl BootStorage for NoStore {
 /// Writes go to `primary`. One that fails goes to `spare` instead, which is
 /// then the authority until a primary write lands again or the spare itself
 /// is lost. Reads prefer the spare exactly when it holds a sealed record,
-/// which is the case where the primary is behind.
+/// which is the case where the primary is behind; a spare that cannot be
+/// read counts as empty, so its read error never masks the primary.
 ///
-/// The spare this exists for is [`BkupRamStore`]: it survives every reset
+/// The spare this exists for is `BkupRamStore`: it survives every reset
 /// including the one `BKSWRST` performs, so a trial keeps counting and can
 /// still revert, and it does *not* survive loss of power, so it cannot
 /// outlive the fault it covers for. Without a spare, a primary whose writes
@@ -340,7 +408,7 @@ impl<P, S> Fallback<P, S> {
 // is only ever handed to one of them whole.
 unsafe impl<P: BootStorage, S: BootStorage> BootStorage for Fallback<P, S> {
     type ReadErr = P::ReadErr;
-    /// The spare's, because a write is only lost when the spare loses it too.
+    /// The spare's, because a write is only lost when the spare loses it too
     type WriteErr = S::WriteErr;
 
     fn read_raw(&mut self) -> Result<BootStore, Self::ReadErr> {
@@ -369,7 +437,7 @@ unsafe impl<P: BootStorage, S: BootStorage> BootStorage for Fallback<P, S> {
     }
 }
 
-/// [`BootStorage`] in backup RAM.
+/// [`BootStorage`] in backup RAM
 ///
 /// Backup RAM keeps its contents across any reset, including the one BKSWRST
 /// performs, so the whole trial and rollback cycle works normally. It does
@@ -391,6 +459,10 @@ impl<const OFFSET: usize> BkupRamStore<OFFSET> {
     ///
     /// Nothing else may use `OFFSET..OFFSET + size_of::<BootStore>()` of
     /// backup RAM.
+    ///
+    /// `OFFSET` must be a multiple of 4 and the record must fit within
+    /// [`BKUPRAM_SIZE`](crate::consts::BKUPRAM_SIZE); both are checked at
+    /// compile time.
     pub const unsafe fn new() -> Self {
         const { assert!(OFFSET.is_multiple_of(4)) };
         const {
@@ -428,16 +500,14 @@ unsafe impl<const OFFSET: usize> BootStorage for BkupRamStore<OFFSET> {
 const STORE_WORDS: usize = size_of::<BootStore>() / 4;
 
 /// A word write to a locked SmartEEPROM is discarded silently; the
-/// read-back in [`SmartEepromStore`]'s `write` surfaces it as this.
+/// read-back in [`SmartEepromStore`]'s
+/// [`write_raw`](BootStorage::write_raw) surfaces it as this.
 #[cfg(feature = "target")]
 pub struct SeeWriteFailed;
 
-/// Why [`SmartEepromStore::new`] rejected the live SmartEEPROM configuration.
-/// `SeeUnavailable`: SBLK 0 (disabled) or a reserved SBLK (11+). `SeeLocked`:
-/// `SEESTAT.LOCK` set (see [`SeeWriteFailed`]). `SeeBuffered`: `SEECFG.WMODE`
-/// buffered, which defers word commits and voids per-word power-atomicity.
-/// `OffsetOutOfRange`: `OFFSET + size_of::<BootStore>()` past the configured
-/// virtual size.
+/// Why [`SmartEepromStore::new`] rejected the live SmartEEPROM
+/// configuration. Each variant's condition is listed under that function's
+/// `# Errors`.
 #[cfg(feature = "target")]
 pub enum StoreConfigError {
     SeeUnavailable,
@@ -454,16 +524,31 @@ pub struct SmartEepromStore<const OFFSET: usize>(());
 
 #[cfg(feature = "target")]
 impl<const OFFSET: usize> SmartEepromStore<OFFSET> {
-    /// Validates the live SmartEEPROM configuration against `OFFSET`.
+    /// Validate the live SmartEEPROM configuration against `OFFSET`
     ///
-    /// Caller must ensure that nothing else is stored in
-    /// `OFFSET..OFFSET + size_of::<BootStore>()`.
+    /// `OFFSET` is a byte offset into the virtual space and must be a
+    /// multiple of 4; that is checked at compile time. Nothing else may be
+    /// stored in `OFFSET..OFFSET + size_of::<BootStore>()`: application data
+    /// written over the record is not detected, it just fails the checksum.
+    ///
+    /// # Errors
+    ///
+    /// * Returns [`StoreConfigError::SeeUnavailable`] if `Nvmctrl.SEESTAT`
+    ///   `SBLK` is 0 (SmartEEPROM disabled) or 11 or higher (reserved).
+    /// * Returns [`StoreConfigError::OffsetOutOfRange`] if the record does
+    ///   not fit below the configured virtual size.
+    /// * Returns [`StoreConfigError::SeeLocked`] if `Nvmctrl.SEESTAT.LOCK`
+    ///   is set; writes would then be discarded silently (see
+    ///   [`SeeWriteFailed`]).
+    /// * Returns [`StoreConfigError::SeeBuffered`] if `Nvmctrl.SEECFG.WMODE`
+    ///   selects buffered mode, which defers word commits and voids the
+    ///   per-word power-atomicity [`BootStorage`] requires.
     pub fn new() -> Result<Self, StoreConfigError> {
         const { assert!(OFFSET.is_multiple_of(4)) };
         // SAFETY: read-only status access
         let regs = unsafe { &*Nvmctrl::ptr() };
         let seestat = regs.seestat().read();
-        // Virtual size per DS Table 25-6: PSZ scales it, SBLK caps it.
+        // Virtual size per DS60001507 table 25-6: PSZ scales it, SBLK caps it.
         let cap = match seestat.sblk().bits() {
             0 | 11.. => return Err(StoreConfigError::SeeUnavailable),
             1 => 4096,
@@ -691,5 +776,70 @@ mod tests {
         state.set_reason(RevertReason::AppRejected);
         assert_eq!(state.revert_reason, 3);
         assert_eq!(state.reason(), Some(RevertReason::AppRejected));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use core::mem::offset_of;
+
+    /// The record is a stored format: a bootloader reads back bytes an older
+    /// build of itself wrote, so these offsets are the contract and a change
+    /// to any of them is a [`BootStore::FMT`] bump.
+    #[test]
+    fn record_layout_is_pinned() {
+        assert_eq!(size_of::<BootStore>(), 16);
+        assert_eq!(offset_of!(BootStore, boot_state), 0);
+        assert_eq!(offset_of!(BootStore, rollback), 4);
+        assert_eq!(offset_of!(BootStore, mailbox), 8);
+        assert_eq!(offset_of!(BootStore, checksum), 12);
+
+        assert_eq!(offset_of!(BootState, states), 0);
+        assert_eq!(offset_of!(BootState, boot_count), 1);
+        assert_eq!(offset_of!(BootState, revert_reason), 2);
+        assert_eq!(offset_of!(BootState, fmt), 3);
+
+        assert_eq!(offset_of!(Rollback, highest_seen_manifest), 0);
+        assert_eq!(offset_of!(UpdateMailbox, flags), 0);
+    }
+
+    /// The checksum covers everything ahead of it, the format byte included,
+    /// so a record cannot claim one layout and be checksummed as another.
+    #[test]
+    fn the_format_byte_is_under_the_checksum() {
+        assert!(offset_of!(BootStore, boot_state) + offset_of!(BootState, fmt) < BootStore::COVERED);
+    }
+
+    /// A record from a layout this build does not know is not acted on, and
+    /// `read` turns that into the fresh default rather than a misreading.
+    #[test]
+    fn an_unknown_layout_is_refused() {
+        let mut record = BootStore::default();
+        record.seal();
+        assert!(record.validated().is_some());
+
+        let mut future = record;
+        future.boot_state.fmt = BootStore::FMT + 1;
+        // Sealed as a valid record of a layout this build cannot read: the
+        // checksum agrees and the answer is still no.
+        future.checksum = future.computed();
+        assert!(future.validated().is_none());
+    }
+
+    /// Reserved space is left alone rather than zeroed, so a value a newer
+    /// bootloader put there survives a round trip through this one.
+    #[test]
+    fn reserved_space_survives_a_reader_that_does_not_know_it() {
+        let mut record = BootStore::default();
+        record.rollback.reserved = 0xBEEF;
+        record.mailbox.reserved = [1, 2, 3];
+        record.boot_state.states |= 0xF0;
+        record.seal();
+
+        let read_back = record.validated().expect("sealed");
+        assert_eq!(read_back.rollback.reserved, 0xBEEF);
+        assert_eq!(read_back.mailbox.reserved, [1, 2, 3]);
+        assert_eq!(read_back.boot_state.states & 0xF0, 0xF0);
     }
 }

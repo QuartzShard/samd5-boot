@@ -1,11 +1,18 @@
-//! Emits `density` / `boot_size` cfgs from the selected features.
-//! Target selection lists each part exactly once (here). The role linker
-//! fragments are written to OUT_DIR and found through `rustc-link-search`;
-//! see the crate docs for how a downstream memory.x pulls one in.
+//! Emits `density` / `boot_size` cfgs from the selected features, and
+//! writes the role linker fragments to OUT_DIR, where `rustc-link-search`
+//! makes them visible to a downstream memory.x (see the crate docs).
+//!
+//! DENSITIES below is the only place a part is mapped to a density
+//! (DS60001507 tables 1-1 and 1-2). The sizes that density stands for are
+//! spelled out a second time, in consts.rs `mod density`, and the two must
+//! agree.
 //!
 //! Products using SmartEEPROM set `SAMD5_BOOT_SEE_SBLK` (the SBLK fuse
-//! value, default 0) so the app region's top drops by the SEE reserve.
-//! Part-to-density mapping per DS60001507 Tables 1-1 / 1-2.
+//! value, 0..=10, default 0) so the app region's top drops by the SEE
+//! reserve. It must match the SBLK the part is provisioned with: the
+//! bootloader bounds a download by the live SEESTAT instead, so a build
+//! that understates it links an application over flash the SmartEEPROM
+//! will claim.
 
 use std::{env, fs, path::PathBuf};
 
@@ -93,8 +100,10 @@ fn main() {
     };
     println!("cargo::rustc-cfg=boot_size=\"{boot_size}\"");
 
-    // Linker scripts need an unambiguous part; otherwise skip generation
-    // and let the compile_error in consts.rs be the diagnostic.
+    // Linker scripts need an unambiguous part. With none selected, the
+    // compile_error in consts.rs is the diagnostic for a `target` build and
+    // a host build wants no scripts anyway; with two densities selected,
+    // the duplicate `mod density` is.
     let &[(digit, ram_size)] = selected_densities.as_slice() else {
         return;
     };

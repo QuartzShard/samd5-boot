@@ -1,9 +1,20 @@
-//! Family-wide geometry (DS60001507, §25 NVMCTRL) is defined
-//! unconditionally; flash/RAM density is selected by the part feature.
-//! Exactly one part feature must be enabled: none is a compile error
-//! below, and more than one collides on the density const definitions.
+//! Flash geometry: the family-wide constants, the formulas over them, and
+//! the values bound to the selected part
 //!
-//! Bank/slot vocabulary is defined in the crate docs.
+//! Family-wide geometry is DS60001507 section 25 (NVMCTRL). Firmware
+//! selects a part feature and reads the bound constants; host tooling
+//! depends on this crate with no features, learns the part at runtime, and
+//! calls [`geometry`] with the sizes it has instead. Only the
+//! density-derived constants are feature-gated: `BOOT_SIZE`,
+//! `BOOTPROT_VALUE` and `BOOT_INFO_ADDR` exist either way and fall back to
+//! a 32 KiB BOOT region, so a host must not read them for a part it was
+//! told about at runtime.
+//!
+//! A `target` build must select a part: without one the `compile_error!`
+//! below fires. Two part features of different densities collide on the
+//! density module below; two of the same density do not collide here.
+//!
+//! Bank and slot are defined in [the crate docs](crate#banks-and-slots).
 
 pub const FLASH_ADDR: usize = 0x0000_0000;
 pub const PAGE_SIZE: usize = 512;
@@ -33,10 +44,12 @@ pub const BKUPRAM_SIZE: usize = 8 * 1024;
 
 // ── Geometry formulas ───────────────────────────────────────────────────
 
-/// The derivations below, over a flash size and BOOT size supplied by the
-/// caller rather than selected by a feature. The firmware binds them to its
-/// part at compile time; host tooling (`xtask`) applies them to a part named
-/// on the command line, so a fuse encoding has exactly one definition.
+/// Geometry formulas over a flash size and BOOT size the caller supplies,
+/// rather than ones a feature selected
+///
+/// The firmware binds these to its part at compile time, in the constants
+/// below. `samd5-boot-tools` applies them to whatever part the operator
+/// named, so a fuse encoding has exactly one definition.
 pub mod geometry {
     use super::{BOOTPROT_GRANULE, BOOTPROT_MAX, LOCK_REGION_COUNT, PAGE_SIZE};
 
@@ -138,12 +151,20 @@ compile_error!(
      are 32 KiB, so BOOT must be at least 32 KiB"
 );
 
+/// Size of the BOOT region at the head of each bank, from the `bootprot-*`
+/// feature; 32 KiB when none is selected, including on a host build.
 #[cfg(boot_size = "16k")]
 pub const BOOT_SIZE: usize = 16 * 1024;
+/// Size of the BOOT region at the head of each bank, from the `bootprot-*`
+/// feature; 32 KiB when none is selected, including on a host build.
 #[cfg(boot_size = "32k")]
 pub const BOOT_SIZE: usize = 32 * 1024;
+/// Size of the BOOT region at the head of each bank, from the `bootprot-*`
+/// feature; 32 KiB when none is selected, including on a host build.
 #[cfg(boot_size = "64k")]
 pub const BOOT_SIZE: usize = 64 * 1024;
+/// Size of the BOOT region at the head of each bank, from the `bootprot-*`
+/// feature; 32 KiB when none is selected, including on a host build.
 #[cfg(boot_size = "96k")]
 pub const BOOT_SIZE: usize = 96 * 1024;
 
@@ -182,9 +203,9 @@ mod tests {
 
     const K: usize = 1024;
 
-    /// DS 25.6.14: BOOTPROT protects `(15 - value)` times 8 KiB. A wrong
-    /// encoding here either leaves BOOT writable or protects into the
-    /// application.
+    /// DS60001507 section 25.6.14: BOOTPROT protects `(15 - value)` times
+    /// 8 KiB. A wrong encoding here either leaves BOOT writable or protects
+    /// into the application.
     #[test]
     fn bootprot_encoding_counts_down() {
         assert_eq!(bootprot_value(0), 15);

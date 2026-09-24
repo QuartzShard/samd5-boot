@@ -17,8 +17,8 @@ use samd5_boot::{consts::BKUPRAM_ADDR, persist::BootStore};
 pub const STORE_OFFSET: usize = 0;
 
 /// GCLK generator 0 out of reset: DFLL48M in open loop (DS 7.3.2). The demo
-/// deliberately does not touch the clock tree, so this is what the core and
-/// every peripheral clock are actually running at.
+/// deliberately does not touch the clock tree, so this is what the core runs
+/// at, and what the SERCOM5 core channel is fed from in the RS485 build.
 pub const CORE_CLOCK_HZ: u32 = 48_000_000;
 
 /// Where the firmware publishes the address of its RTT control block.
@@ -35,4 +35,5 @@ pub const CORE_CLOCK_HZ: u32 = 48_000_000;
 /// The magic is written last, so a half-written slot is not trusted.
 pub const RTT_POINTER_OFFSET: usize = STORE_OFFSET + size_of::<BootStore>();
 pub const RTT_POINTER_ADDR: usize = BKUPRAM_ADDR + RTT_POINTER_OFFSET;
+/// ASCII `rttp`.
 pub const RTT_POINTER_MAGIC: u32 = 0x7274_7470;
