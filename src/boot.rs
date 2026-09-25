@@ -8,7 +8,10 @@
 //! goes through [`Boot::verify`]: its `Boot<Verified>` is the only thing
 //! that unlocks [`boot_active`](Boot::<Verified>::boot_active). Finally, a
 //! call that returns instead of booting leaves the binary in download mode,
-//! where it drives its own transport into [`Boot::install`].
+//! where it drives its own transport into [`Boot::install`]. That one takes
+//! its image source as a closure, which runs once the boot record condemns
+//! the bank about to be overwritten and before anything is erased: the one
+//! moment at which a receiver can be declared ready.
 //!
 //! [`Boot::revert`] abandons the active image and swaps back;
 //! [`Boot::free`] hands the peripherals out again.
@@ -124,7 +127,7 @@ pub enum InstallError<W> {
 }
 
 /// Failure of [`Boot::download`].
-pub enum DownloadError {
+enum DownloadError {
     Flash(FlashError),
     Verify(VerifyError),
 }
@@ -172,12 +175,25 @@ pub enum Disposition {
     NoImage,
 }
 
+/// Proof that the boot record condemns the inactive bank, so its contents
+/// may be destroyed
+///
+/// It carries no data and cannot be built from outside this crate: its
+/// whole job is to be impossible to hold without the record having been
+/// written first, which is what stops an erase reaching a bank the record
+/// still calls bootable.
+///
+/// [`Boot::install`] lends one to the closure that builds its image source,
+/// which is how it names the moment between that write and the first erase.
+/// See that method.
+pub struct Condemned(());
+
 const fn app_begin(base: usize) -> usize {
     base + BOOT_SIZE
 }
 
 impl<S: SlotState> Boot<S> {
-    fn app_region_len(&self) -> usize {
+    pub fn app_region_len(&self) -> usize {
         BANK_SIZE - BOOT_SIZE - see_reserve(&self.nvm)
     }
 
@@ -187,8 +203,13 @@ impl<S: SlotState> Boot<S> {
     /// Erases ahead block by block, so no separate erase pass is needed,
     /// and holds the NVM cache disabled while it writes (errata 2.14.1).
     /// Bounded below the slot's live SmartEEPROM reserve.
-    pub fn download(
+    ///
+    /// The [`Condemned`] is what makes this safe to call: the erase-ahead
+    /// destroys the bank's image, and only [`Boot::condemn`] issues the
+    /// token, so the record cannot still be calling that bank bootable.
+    fn download(
         &mut self,
+        _condemned: Condemned,
         source: impl core::iter::Iterator<Item = u8>,
     ) -> Result<(), DownloadError> {
         let begin = app_begin(INACTIVE_SLOT_ADDR);
@@ -197,9 +218,20 @@ impl<S: SlotState> Boot<S> {
         // and `begin..end` is the inactive slot's app region, and nothing
         // executes there, and the mirror BOOT below `begin` is untouched.
         let writer = unsafe { flash_writer::FlashWriter::new(&mut self.nvm, begin, end) };
+
+        // Counted because `check_slot` below reads the slot, not the source.
+        // A source that runs dry before the manifest is reached leaves that
+        // manifest as it was, and verifying the image that was already there
+        // would report success for a download that never happened.
+        let mut delivered = 0usize;
+        let counted = source.inspect(|_| delivered += 1);
         writer
-            .write(flash_writer::pages(flash_writer::words(source)))
+            .write(flash_writer::pages(flash_writer::words(counted)))
             .map_err(DownloadError::Flash)?;
+        if delivered < manifest::MIN_IMAGE_LEN {
+            return Err(DownloadError::Verify(VerifyError::BadLen));
+        }
+
         self.check_slot(INACTIVE_SLOT_ADDR)
             .map_err(DownloadError::Verify)
     }
@@ -209,8 +241,8 @@ impl<S: SlotState> Boot<S> {
     ///
     /// The other bank must already hold a working image. Nothing here
     /// checks it, and the reset lands in whatever sits at its base:
-    /// [`Boot::install`] reaches this only after [`Boot::download`]'s
-    /// read-back, and [`Boot::fall_back`] only with a bank recorded
+    /// [`Boot::install`] reaches this only after its own read-back
+    /// verify, and [`Boot::fall_back`] only with a bank recorded
     /// [`BankState::Valid`], but [`Boot::revert`] and the `ResumeInstall`
     /// and `Rollback` arms of [`Boot::boot_or_enter_download`] reach it
     /// without checking the destination.
@@ -225,6 +257,29 @@ impl<S: SlotState> Boot<S> {
     pub fn swap_reboot(mut self) -> ! {
         cortex_m::interrupt::disable();
         unsafe { self.nvm.bank_swap() }
+    }
+
+    /// Record the inactive bank as [`BankState::Invalid`], so its contents
+    /// may be destroyed, and return the proof of it
+    ///
+    /// Until a download has verified, the bank holds neither the old image
+    /// nor a whole new one, and a record still calling it `Valid` is one
+    /// [`Boot::fall_back`] would hand control to without verifying first.
+    /// So the record is written pessimistic before any erase, and only a
+    /// completed install makes it bootable again.
+    ///
+    /// `record` is amended in place, so the rest of the install carries the
+    /// same record rather than writing back a stale one.
+    fn condemn<St: BootStorage>(
+        &mut self,
+        store: &mut St,
+        record: &mut BootStore,
+    ) -> Result<Condemned, St::WriteErr> {
+        record
+            .boot_state
+            .set_bank(&self.inactive_bank(), BankState::Invalid);
+        store.write(*record)?;
+        Ok(Condemned(()))
     }
 
     fn inactive_bank(&self) -> PhysicalBank {
@@ -244,13 +299,44 @@ impl<S: SlotState> Boot<S> {
     /// refer to the image being replaced, and carrying one over would let
     /// the outgoing image's confirmation promote the incoming one before it
     /// has served a trial at all.
-    pub fn install<St: BootStorage>(
+    ///
+    /// # Building the source
+    ///
+    /// `source` is a closure rather than the iterator itself so that it
+    /// runs at the one moment that is neither too early nor too late: the
+    /// record already condemns the bank, and not a byte has been erased or
+    /// read yet. A receiver that must be declared ready, or a host that
+    /// must be told to start sending, belongs there. Before the call is too
+    /// early, because the bank is still recorded bootable; after it returns
+    /// is far too late, because a successful install never returns.
+    ///
+    /// It matters because condemning the bank means writing the boot
+    /// record, and on a
+    /// [`SmartEepromStore`](crate::persist::SmartEepromStore) that write is
+    /// a flash program. A caller that draws bytes off the wire in its
+    /// own foreground is not doing so for the duration, so a host that
+    /// began streaming before this point is streaming at a receiver that
+    /// cannot drain.
+    ///
+    /// A caller with nothing to signal passes `|_| source`.
+    pub fn install<St: BootStorage, I: core::iter::Iterator<Item = u8>>(
         mut self,
         store: &mut St,
         mut record: BootStore,
-        source: impl core::iter::Iterator<Item = u8>,
+        source: impl FnOnce(&Condemned) -> I,
     ) -> Aborted<InstallError<St::WriteErr>, Self> {
-        if let Err(e) = self.download(source) {
+        let condemned = match self.condemn(store, &mut record) {
+            Ok(c) => c,
+            Err(e) => {
+                return Aborted {
+                    error: InstallError::Write(e),
+                    boot: self,
+                };
+            }
+        };
+
+        let source = source(&condemned);
+        if let Err(e) = self.download(condemned, source) {
             return Aborted {
                 error: e.into(),
                 boot: self,

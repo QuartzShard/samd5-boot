@@ -54,6 +54,14 @@ written where they sit. It writes the inactive head, issues `BKSWRST` to
 swap, writes the head that is now inactive, and swaps back, leaving the same
 bank active as before. With BOOTPROT unset it writes both heads directly.
 
+The swap also resets the part, so the bootloader at the newly active head
+would otherwise start running mid-sequence, read its boot record and decide
+for itself which bank should be active. A bank recorded `Invalid`, which is
+what a failed update leaves behind, is one it reverts out of, and the two
+swaps then cancel and the second head never gets written. So the swap arms
+the reset vector catch and holds the core halted for the length of the
+sequence instead of racing it.
+
 ## Recovery
 
 `provision` saves the user page to `userpage-<chip>.bak` in `--backup-dir`

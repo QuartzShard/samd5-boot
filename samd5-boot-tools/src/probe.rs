@@ -14,7 +14,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use probe_rs::{Core, MemoryInterface, Session, SessionConfig};
+use probe_rs::{Core, MemoryInterface, Session, SessionConfig, VectorCatchCondition};
 
 const NVMCTRL: u64 = 0x4100_4000;
 const CTRLA: u64 = NVMCTRL;
@@ -123,6 +123,7 @@ impl Device {
         Ok(Nvm {
             core,
             mode: self.mode,
+            leave_halted: false,
         })
     }
 }
@@ -131,6 +132,7 @@ impl Device {
 pub struct Nvm<'a> {
     core: Core<'a>,
     mode: Mode,
+    leave_halted: bool,
 }
 
 /// Flash geometry read from `NVMCTRL.PARAM`, in bytes
@@ -217,6 +219,33 @@ impl Nvm<'_> {
             .write_word_16(CTRLA, ctrla)
             .context("restoring the NVM cache")?;
         out
+    }
+
+    /// Leave the core halted when this drops, rather than running it
+    ///
+    /// The default is to put the part back as it was found. A sequence that
+    /// must not let the firmware run between its steps says so here.
+    pub fn stay_halted(&mut self) {
+        self.leave_halted = true;
+    }
+
+    /// Halt at the reset vector on the next reset, instead of running from it
+    ///
+    /// `BKSWRST` resets the part as part of the command, which hands control
+    /// to the BOOT at the newly active bank's head before the debugger can
+    /// halt it again. That BOOT reads the boot record and acts on it, and one
+    /// of the things it can decide is to swap straight back: a bank recorded
+    /// [`BankState::Invalid`](samd5_boot::persist::BankState::Invalid), which
+    /// is what any failed download leaves behind, is one `Boot::fall_back`
+    /// reverts out of. Catching the reset settles that instead of racing it.
+    pub fn catch_reset(&mut self, on: bool) -> Result<()> {
+        let condition = VectorCatchCondition::CoreReset;
+        if on {
+            self.core.enable_vector_catch(condition)
+        } else {
+            self.core.disable_vector_catch(condition)
+        }
+        .context("setting the reset vector catch")
     }
 
     /// Plain flash reads, for comparing a programmed image against its file
@@ -347,7 +376,9 @@ impl Drop for Nvm<'_> {
     /// Best effort: a drop cannot report. The case that fails is a core that
     /// has just reset itself, which is running anyway.
     fn drop(&mut self) {
-        let _ = self.core.run();
+        if !self.leave_halted {
+            let _ = self.core.run();
+        }
     }
 }
 

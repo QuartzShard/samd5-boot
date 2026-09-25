@@ -14,6 +14,10 @@ publish = false
 default = ["rtt"]
 rtt = ["dep:demo-rtt"]
 rs485 = ["dep:demo-serial"]
+# Keep the boot record in SmartEEPROM rather than backup RAM. The
+# application must be built with it too, and the part provisioned with a
+# non-zero SBLK.
+see-store = []
 
 [dependencies]
 samd5-boot = { path = "../../..", features = ["samd51j20a"] }

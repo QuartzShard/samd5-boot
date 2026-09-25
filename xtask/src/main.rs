@@ -34,6 +34,10 @@ enum Cmd {
         /// Build for the RS485 link rather than RTT.
         #[arg(long)]
         rs485: bool,
+        /// Keep the boot record in SmartEEPROM rather than backup RAM.
+        /// Needs a part provisioned with `--sblk`.
+        #[arg(long)]
+        see: bool,
     },
 
     /// Stamp a manifest into a linked application image so BOOT verifies it.
@@ -81,9 +85,13 @@ enum Cmd {
         #[arg(long)]
         chip: String,
         /// Byte offset of the boot record in backup RAM. The default is what
-        /// the demo firmware uses.
+        /// the demo firmware uses. Ignored with `--see`.
         #[arg(long, default_value_t = demo_rig::STORE_OFFSET)]
         store_offset: usize,
+        /// Amend the record in SmartEEPROM rather than backup RAM, for
+        /// firmware built with `see-store`.
+        #[arg(long)]
+        see: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -107,6 +115,10 @@ enum Cmd {
         /// RTT. The firmware must have been built with `--features rs485`.
         #[arg(long, short)]
         port: Option<String>,
+        /// Run the suite against a boot record in SmartEEPROM rather than
+        /// backup RAM. Needs a part provisioned with `--sblk`.
+        #[arg(long)]
+        see: bool,
         /// Use the images already in `examples/update-rig/` rather than
         /// rebuilding them.
         #[arg(long)]
@@ -143,6 +155,8 @@ enum LinkOp {
     Ping { text: Option<String> },
     /// Ask the application what it is running.
     State,
+    /// Ask the application what the boot record says about each bank.
+    Banks,
     /// Stream an image into the inactive bank.
     Update { image: PathBuf },
     /// The same with one body byte inverted, to drive the verify path.
@@ -179,8 +193,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     match Cli::parse().command {
-        Cmd::Build { rs485 } => {
-            let built = image::build_demo(image::Transport::for_rs485(rs485))?;
+        Cmd::Build { rs485, see } => {
+            let built = image::build_demo(
+                image::Transport::for_rs485(rs485),
+                image::Store::for_see(see),
+            )?;
             println!("\nbuilt:");
             for p in [&built.boot, &built.app, &built.app_noconfirm] {
                 println!("  {}", p.display());
@@ -223,8 +240,13 @@ fn run() -> Result<()> {
         Cmd::RequestUpdate {
             chip,
             store_offset,
+            see,
             dry_run,
-        } => provision::request_update(&chip, record_addr(store_offset), mode(dry_run)),
+        } => provision::request_update(
+            &chip,
+            record_addr(image::Store::for_see(see), store_offset),
+            mode(dry_run),
+        ),
 
         Cmd::Flash {
             chip,
@@ -238,10 +260,18 @@ fn run() -> Result<()> {
         Cmd::Test {
             chip,
             port,
+            see,
             skip_build,
             skip_flash,
             log,
-        } => self_test(&chip, port.as_deref(), skip_build, skip_flash, log),
+        } => self_test(TestRun {
+            chip: &chip,
+            port: port.as_deref(),
+            store: image::Store::for_see(see),
+            skip_build,
+            skip_flash,
+            log,
+        }),
 
         Cmd::Link {
             chip,
@@ -269,9 +299,14 @@ fn open_link(chip: &str, port: Option<&str>, log: bool) -> Result<Link<Box<dyn T
     Ok(link)
 }
 
-/// Where the rig's firmware keeps its boot record.
-fn record_addr(store_offset: usize) -> u64 {
-    (samd5_boot::consts::BKUPRAM_ADDR + store_offset) as u64
+/// Where the rig's firmware keeps its boot record, for the backend it was
+/// built against. The SmartEEPROM build uses `SmartEepromStore<0>`, so its
+/// record sits at the base of the virtual space.
+fn record_addr(store: image::Store, store_offset: usize) -> u64 {
+    match store {
+        image::Store::BkupRam => (samd5_boot::consts::BKUPRAM_ADDR + store_offset) as u64,
+        image::Store::SmartEeprom => samd5_boot::consts::SEEPROM_ADDR as u64,
+    }
 }
 
 fn mode(dry_run: bool) -> Mode {
@@ -332,6 +367,18 @@ fn link_op(link: &mut Link<Box<dyn Transport>>, op: LinkOp) -> Result<()> {
             }
         }
 
+        LinkOp::Banks => {
+            request(link, &Message::GetBanks)?;
+            match link.recv(Instant::now() + reply_timeout)? {
+                Some(Message::Banks { active, inactive }) => {
+                    println!("<- Banks {{ active: {active}, inactive: {inactive} }}");
+                    Ok(())
+                }
+                Some(other) => bail!("unexpected {other:?}"),
+                None => bail!("no Banks within {reply_timeout:?} (no application running?)"),
+            }
+        }
+
         LinkOp::Update { image } => send_image(link, &image, Body::AsBuilt),
         LinkOp::Bogus { image } => send_image(link, &image, Body::Corrupted),
 
@@ -367,7 +414,7 @@ fn send_image(link: &mut Link<Box<dyn Transport>>, image: &Path, body: Body) -> 
         println!("corrupted byte {at} of {}", bytes.len());
     }
     let len: u32 = bytes.len().try_into().context("image exceeds 4 GiB")?;
-    request(link, &Message::BeginUpdate { len })?;
+    link.begin_update(len, Duration::from_secs(10))?;
     let started = Instant::now();
     link.write_raw(&bytes)?;
     println!("   {len} bytes sent in {:.1}s", started.elapsed().as_secs_f32());
@@ -387,51 +434,51 @@ fn send_image(link: &mut Link<Box<dyn Transport>>, image: &Path, body: Body) -> 
     }
 }
 
-/// Open a link with something alive on the far end, asking BOOT to wait
-/// through the debugger if nothing is.
-///
-/// The usual reason nothing answers is that BOOT has booted an application
-/// built for the other transport, which cannot be asked to step aside over a
-/// link it does not speak. That shows up two different ways: over RTT there
-/// is no control block to attach to, while a serial port opens perfectly
-/// well and simply stays quiet. So the test is whether anything answers, not
-/// whether the link opened.
-fn live_link(chip: &str, port: Option<&str>, log: bool) -> Result<Link<Box<dyn Transport>>> {
-    match open_link(chip, port, log) {
-        Ok(mut link) => {
-            if answers(&mut link) {
-                return Ok(link);
-            }
-        }
-        Err(e) if port.is_none() => eprintln!("{e:#}\n"),
-        Err(e) => return Err(e),
-    }
-    println!("nothing answered on the link; asking BOOT to wait, through the debugger");
-    // RTT holds the probe and `request_update` needs it: the link above is a
-    // match binding, so it has already dropped by here.
-    provision::request_update(chip, record_addr(demo_rig::STORE_OFFSET), Mode::Run)?;
-    open_link(chip, port, log)
-}
-
-fn self_test(
-    chip: &str,
-    port: Option<&str>,
+struct TestRun<'a> {
+    chip: &'a str,
+    port: Option<&'a str>,
+    store: image::Store,
     skip_build: bool,
     skip_flash: bool,
     log: bool,
-) -> Result<()> {
+}
+
+fn self_test(run: TestRun) -> Result<()> {
+    let TestRun {
+        chip,
+        port,
+        store,
+        skip_build,
+        skip_flash,
+        log,
+    } = run;
+
     let built = if skip_build {
         image::Artifacts::in_demo_dir()
     } else {
         // A `--port` means the rig is on RS485, so the firmware has to be.
-        image::build_demo(image::Transport::for_rs485(port.is_some()))?
+        image::build_demo(image::Transport::for_rs485(port.is_some()), store)?
     };
 
     if !skip_flash {
         flash::run(chip, &built.boot, Mode::Run)?;
     }
 
-    let mut link = live_link(chip, port, log)?;
+    // Ask BOOT to wait before anything else, through the debugger rather
+    // than through the application.
+    //
+    // Whatever image is installed may have been built for another link or
+    // another record store, and neither is something the host can ask
+    // about: an image built against the other `BootStorage` answers `Ping`
+    // and `GetState` perfectly well while writing a record this BOOT never
+    // reads, so it would sit there refusing to step aside with nothing to
+    // show for it. The debugger does not depend on the image at all.
+    provision::request_update(chip, record_addr(store, demo_rig::STORE_OFFSET), Mode::Run)?;
+
+    let mut link = open_link(chip, port, log)?;
+    if !answers(&mut link) {
+        bail!("nothing answered a Ping after BOOT was asked to wait for an image");
+    }
     println!();
     match selftest::run(&mut link, &built.app, &built.app_noconfirm) {
         Ok(true) => Ok(()),

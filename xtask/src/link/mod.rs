@@ -5,8 +5,9 @@
 //! device reset call [`Link::resync`] before the next exchange.
 //!
 //! Framing is the same either way (COBS-delimited postcard, with a raw image
-//! body following a `BeginUpdate`), so it lives here once and the transports
-//! only have to move bytes.
+//! body following the `Ready` that answers a `BeginUpdate`; see
+//! [`Link::begin_update`]), so it lives here once and the transports only
+//! have to move bytes.
 
 use std::time::{Duration, Instant};
 
@@ -147,5 +148,25 @@ impl<T: Transport> Link<T> {
             }
         }
         bail!("no Pong within {timeout:?}")
+    }
+
+    /// Announce an image and wait for BOOT to ask for the body.
+    ///
+    /// BOOT answers with `Ready` from inside `Boot::install`, once the boot
+    /// record condemns the target bank and before anything has been erased.
+    /// Waiting for it is what stops the host streaming at a device whose
+    /// only reader is busy writing that record: on a SmartEEPROM store that
+    /// write is a flash program, and bytes sent during it have nowhere to
+    /// go but the link's receive buffer.
+    pub fn begin_update(&mut self, len: u32, timeout: Duration) -> Result<()> {
+        self.flush_input()?;
+        self.send(&Message::BeginUpdate { len })?;
+        let deadline = Instant::now() + timeout;
+        while let Some(msg) = self.recv(deadline)? {
+            if let Message::Ready = msg {
+                return Ok(());
+            }
+        }
+        bail!("BOOT did not ask for the image body within {timeout:?}")
     }
 }

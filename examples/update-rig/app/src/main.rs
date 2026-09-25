@@ -10,12 +10,13 @@
 //! itself, waiting for the host's `BeginUpdate` once the request flag is set,
 //! so nothing here touches flash.
 //!
-//! BOOT keeps its trial record in backup RAM, so a freshly installed image
-//! boots on trial: this image calls
+//! BOOT keeps its trial record in backup RAM by default, so a freshly
+//! installed image boots on trial: this image calls
 //! [`confirm`](samd5_boot::client::BootClient::confirm) early in `main` to
 //! mark itself good, which also takes the trial watchdog off BOOT's terms.
 //! Building with `--features noconfirm` skips that call, which is how the
-//! rig exercises the auto-revert path.
+//! rig exercises the auto-revert path. `--features see-store` moves the
+//! record to SmartEEPROM instead, which BOOT must be built with too.
 //!
 //! Under `--features rs485` the link's baud divisor assumes GCLK generator 0
 //! is still the reset DFLL48M at 48 MHz; deliberately nothing here
@@ -32,8 +33,20 @@ use samd5_boot::{
     client::BootClient,
     install_manifest,
     manifest::AppManifest,
-    persist::{BkupRamStore, RevertReason},
+    persist::{BankState, RevertReason},
 };
+
+#[cfg(not(feature = "see-store"))]
+use samd5_boot::persist::BkupRamStore;
+#[cfg(feature = "see-store")]
+use samd5_boot::persist::SmartEepromStore;
+
+/// Where the boot record lives. BOOT must be built to match, or the two do
+/// not see each other's writes.
+#[cfg(not(feature = "see-store"))]
+type Store = BkupRamStore<{ link::STORE_OFFSET }>;
+#[cfg(feature = "see-store")]
+type Store = SmartEepromStore<0>;
 
 /// Identifies this build on the wire, so the host can tell which image a
 /// device came back running. The no-confirm build is a different image.
@@ -83,8 +96,13 @@ fn main() -> ! {
 
     let mut decoder = Decoder::new();
 
-    // SAFETY: the same backup-RAM record BOOT keeps, at the same offset.
-    let mut client = BootClient::new(unsafe { BkupRamStore::<{ link::STORE_OFFSET }>::new() });
+    let Some(store) = open_store() else {
+        rprintln!("app: SmartEEPROM unusable, run `cargo xtask provision --sblk 1`");
+        park()
+    };
+    let mut client = BootClient::new(store);
+    // Read only, to name which bank this image is running from.
+    let nvm = hal::nvm::Nvm::new(peripherals.nvmctrl);
     // An unreadable store and a code this build cannot decode both report
     // here as no revert.
     let reason = client
@@ -146,15 +164,39 @@ fn main() -> ! {
                 };
                 send(&mut serial, &state);
             }
+            Message::GetBanks => {
+                // An unreadable record reports as two `None`s, which is what
+                // a fresh one holds anyway.
+                let banks = client.banks(&nvm).ok();
+                send(
+                    &mut serial,
+                    &Message::Banks {
+                        active: banks.as_ref().map_or(BankState::None, |b| b.active) as u8,
+                        inactive: banks.as_ref().map_or(BankState::None, |b| b.inactive) as u8,
+                    },
+                );
+            }
             Message::Reject => {
                 rprintln!("app: condemning this image, resetting to roll back");
                 let _ = client.reject();
                 cortex_m::peripheral::SCB::sys_reset();
             }
-            // Pong / BeginUpdate / UpdateResult are not this side's traffic.
+            // Pong / BeginUpdate / UpdateResult / Banks are not this side's
+            // traffic.
             _ => {}
         }
     }
+}
+
+#[cfg(not(feature = "see-store"))]
+fn open_store() -> Option<Store> {
+    // SAFETY: the same backup-RAM record BOOT keeps, at the same offset.
+    Some(unsafe { BkupRamStore::new() })
+}
+
+#[cfg(feature = "see-store")]
+fn open_store() -> Option<Store> {
+    SmartEepromStore::new().ok()
 }
 
 fn send(serial: &mut Link, msg: &Message) {
@@ -167,9 +209,13 @@ fn send(serial: &mut Link, msg: &Message) {
     }
 }
 
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn park() -> ! {
     loop {
         cortex_m::asm::wfi();
     }
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    park()
 }

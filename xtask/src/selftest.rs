@@ -1,8 +1,9 @@
 //! The rig's self-test: drives the bootloader's update paths over the link
 //! and prints one PASS/FAIL line per check. [`run`] is the whole suite, in
 //! order and against one device: install, verify-and-reject, trial, both
-//! rollbacks, and the application-requested update window. Each check
-//! starts from the state the one before it left.
+//! rollbacks, the application-requested update window, and a download that
+//! delivers nothing. Each check starts from the state the one before it
+//! left.
 
 use std::fs;
 use std::path::Path;
@@ -10,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use proto::{Message, Status};
-use samd5_boot::{manifest, persist::RevertReason};
+use samd5_boot::{
+    manifest,
+    persist::{BankState, RevertReason},
+};
 
 use crate::image;
 use crate::link::{Link, Transport};
@@ -19,6 +23,9 @@ use crate::link::{Link, Transport};
 const APP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A rejected install answers quickly; a successful one never answers.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Long enough for BOOT to write the boot record, which on a SmartEEPROM
+/// store is a flash program.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Report {
     passed: usize,
@@ -90,20 +97,58 @@ fn wait_for_app<T: Transport>(link: &mut Link<T>, timeout: Duration) -> Result<A
 /// `Boot::install` swaps and reboots rather than replying.
 fn send_image<T: Transport>(link: &mut Link<T>, image: &[u8]) -> Result<Option<Status>> {
     let len: u32 = image.len().try_into().context("image too large")?;
-    link.flush_input()?;
-    link.send(&Message::BeginUpdate { len })?;
+    link.begin_update(len, READY_TIMEOUT)?;
     link.write_raw(image)?;
+    install_result(link)
+}
 
+/// Announce an image of `len` bytes and then send none of it, so the
+/// device's stream runs dry before it has delivered anything.
+///
+/// The device gives up on the body after its own byte timeout and reports
+/// the install like any other failure.
+fn send_nothing<T: Transport>(link: &mut Link<T>, len: usize) -> Result<Option<Status>> {
+    let len: u32 = len.try_into().context("image too large")?;
+    link.begin_update(len, READY_TIMEOUT)?;
+    install_result(link)
+}
+
+/// What the device made of the install just streamed to it, or `None` if it
+/// never answered.
+fn install_result<T: Transport>(link: &mut Link<T>) -> Result<Option<Status>> {
     let deadline = Instant::now() + INSTALL_TIMEOUT;
     loop {
         match link.recv(deadline) {
             Ok(Some(Message::UpdateResult(status))) => return Ok(Some(status)),
             Ok(Some(_)) => continue,
-            Ok(None) => break,
+            Ok(None) => return Ok(None),
             Err(e) => return Err(e),
         }
     }
-    Ok(None)
+}
+
+/// Ask the running application what the boot record says about each bank.
+fn banks<T: Transport>(link: &mut Link<T>) -> Result<(BankState, BankState)> {
+    link.flush_input()?;
+    link.send(&Message::GetBanks)?;
+    let by = Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(msg)) = link.recv(by) {
+        if let Message::Banks { active, inactive } = msg {
+            return Ok((bank_state(active), bank_state(inactive)));
+        }
+    }
+    bail!("the application did not report the recorded bank states")
+}
+
+/// The wire code as the library's own enum. Anything a `BankState` cannot
+/// be is a device speaking a record format this build does not know.
+fn bank_state(code: u8) -> BankState {
+    match code {
+        0 => BankState::None,
+        1 => BankState::Valid,
+        2 => BankState::New,
+        _ => BankState::Invalid,
+    }
 }
 
 /// Ask the application to request an update and reset, so BOOT waits for
@@ -120,12 +165,19 @@ fn plain_reset<T: Transport>(link: &mut Link<T>) -> Result<()> {
     link.send(&Message::Reset)
 }
 
-/// Wait until the application has gone, so BOOT owns the link.
+/// Wait until BOOT owns the link, rather than the application.
 ///
 /// BOOT waits for an image without a deadline, so there is no window to
-/// race: the only thing to establish is that the application is no longer
-/// the one answering. `GetState` is answered by the application alone,
-/// which makes its silence the signal.
+/// race once it is there. Getting there takes two signals, not one: that
+/// something is listening at all, and that it is not the application.
+/// `Ping` is answered by both, `GetState` by the application alone.
+///
+/// Silence on its own will not do, which is what this used to read. A
+/// device in the middle of a reset is also silent, and with the boot
+/// record in SmartEEPROM every write to it is a flash program, which
+/// widens that window enough to walk into: the host would start streaming
+/// an image at a device that was not listening yet and fill the link's
+/// receive buffer instead.
 ///
 /// It can take two resets. When the running image has just confirmed a
 /// trial, the next boot is the promotion, which outranks the update
@@ -136,6 +188,9 @@ fn wait_for_boot<T: Transport>(link: &mut Link<T>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         let _ = link.resync();
+        if link.ping(*b"waitboot", Duration::from_millis(600)).is_err() {
+            continue;
+        }
         if link.send(&Message::GetState).is_err() {
             continue;
         }
@@ -150,7 +205,7 @@ fn wait_for_boot<T: Transport>(link: &mut Link<T>) -> Result<()> {
             return Ok(());
         }
     }
-    bail!("the application never stopped answering")
+    bail!("BOOT never took the link over from the application")
 }
 
 /// Install `image`, waiting for the application to come back up.
@@ -322,6 +377,51 @@ pub fn run<T: Transport>(link: &mut Link<T>, good: &Path, noconfirm: &Path) -> R
                     s.reason(),
                     s.confirmed
                 )
+            }
+        }),
+    );
+
+    // A download that delivers nothing must be refused even when the bank
+    // it was going into still holds a whole image. Verification reads the
+    // slot rather than the source, so an empty stream would otherwise
+    // re-certify what was already there and install it as a fresh trial.
+    r.check(
+        "verify: a download that delivers no bytes is rejected",
+        (|| {
+            // Leaves a verified image in the bank the empty download will
+            // target, which is what makes a stale-slot pass observable.
+            install_and_wait(link, &good_image)?;
+            reboot(link)?;
+            wait_for_boot(link)?;
+            match send_nothing(link, good_image.len())? {
+                Some(Status::VerifyFailed) => Ok(()),
+                Some(other) => bail!("device said {other:?}"),
+                None => bail!("device accepted a download that sent no bytes"),
+            }
+        })(),
+    );
+    r.check(
+        "verify: the running image survives a download that delivers no bytes",
+        wait_for_app(link, APP_TIMEOUT).and_then(|s| {
+            if s.version == good_version {
+                Ok(())
+            } else {
+                bail!("running version {} instead", s.version)
+            }
+        }),
+    );
+
+    // The bank a failed download was writing must not be left recorded as
+    // bootable: `Boot::fall_back` swaps to a `Valid` bank without verifying
+    // it first, so the record is the only thing standing between a
+    // half-written bank and a boot into it.
+    r.check(
+        "install: a failed download leaves its target bank condemned",
+        banks(link).and_then(|(_, inactive)| {
+            if inactive == BankState::Invalid {
+                Ok(())
+            } else {
+                bail!("the other bank reads {inactive:?}, not Invalid")
             }
         }),
     );

@@ -14,9 +14,12 @@
 //!    before the [`trial_timeout`](crate::boot::BootConfig::trial_timeout)
 //!    BOOT armed expires.
 //!
-//! Afterwards [`BootClient::reject`] condemns the running image, and
+//! Afterwards [`BootClient::reject`] condemns the running image,
 //! [`BootClient::request_update`] asks BOOT to enter download mode on the
-//! next boot. Every call is a read-modify-write of the boot record.
+//! next boot, and [`BootClient::banks`] reads what the record says about
+//! each bank, which is how an application learns whether this boot has
+//! anything to fall back on. Every write is a read-modify-write of the boot
+//! record.
 
 use atsamd_hal as hal;
 use embedded_hal_02::watchdog::{Watchdog as _, WatchdogDisable, WatchdogEnable};
@@ -25,7 +28,9 @@ use hal::{
     watchdog::{Watchdog, WatchdogTimeout},
 };
 
-use crate::persist::{BootStorage, RevertReason, UpdateMailbox};
+use hal::nvm::{Nvm, PhysicalBank};
+
+use crate::persist::{BankState, BootStorage, RevertReason, UpdateMailbox};
 
 /// What [`BootClient::confirm`] did with the watchdog
 pub enum WdtHandoff {
@@ -52,6 +57,17 @@ pub struct BootOutcome {
     /// reports the same reason. `None` is also what an unrecognised code
     /// reads as, which is what a record written by a newer BOOT looks like.
     pub revert_reason: Option<RevertReason>,
+}
+
+/// What the boot record says about each physical bank
+pub struct Banks {
+    /// The bank this image is running from.
+    pub active: BankState,
+    /// The other bank. [`BankState::Valid`] there is an image
+    /// [`fall_back`](crate::boot::Boot::fall_back) would swap to without
+    /// verifying it first, so it is also the answer to whether this boot has
+    /// anything behind it; anything else means it does not.
+    pub inactive: BankState,
 }
 
 /// The application-side handle over the shared [`BootStorage`]: the
@@ -88,6 +104,22 @@ impl<St: BootStorage> BootClient<St> {
         let record = self.store.read()?;
         Ok(BootOutcome {
             revert_reason: record.boot_state.reason(),
+        })
+    }
+
+    /// Read what the bootloader's record says about each bank
+    ///
+    /// `nvm` is read only, to name which bank is running.
+    pub fn banks(&mut self, nvm: &Nvm) -> Result<Banks, St::ReadErr> {
+        let active = nvm.first_bank();
+        let inactive = match active {
+            PhysicalBank::A => PhysicalBank::B,
+            PhysicalBank::B => PhysicalBank::A,
+        };
+        let record = self.store.read()?;
+        Ok(Banks {
+            active: record.boot_state.bank(&active),
+            inactive: record.boot_state.bank(&inactive),
         })
     }
 

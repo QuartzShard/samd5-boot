@@ -2,11 +2,15 @@
 //! either transport.
 //!
 //! Control traffic is a single [`Message`] enum, postcard-serialized and
-//! COBS-framed (a `0x00` delimiter ends each frame). After a
-//! [`Message::BeginUpdate`] frame the sender streams `len` RAW image bytes
-//! that are NOT a `Message`: decode the BeginUpdate frame, then treat
+//! COBS-framed (a `0x00` delimiter ends each frame).
+//!
+//! An image is the exception. The host sends [`Message::BeginUpdate`], waits
+//! for the device to answer [`Message::Ready`], and then streams `len` RAW
+//! bytes that are NOT a `Message`: decode the Ready frame, then treat
 //! [`Feed::Frame::remaining`] and everything after it as the raw image so it
-//! can flow straight into `Boot::install` without buffering.
+//! can flow straight into `Boot::install` without buffering. The wait is
+//! what keeps the body off a device that is still writing its boot record
+//! and so not reading the link.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -65,6 +69,17 @@ pub enum Message {
     },
     /// host -> app: condemn the running image and reset, so BOOT rolls back.
     Reject,
+    /// host -> app; answered with `Banks`.
+    GetBanks,
+    /// device -> BOOT's host: the target bank is recorded unbootable and
+    /// nothing has been erased yet, so the raw image body may start. BOOT
+    /// sends this from `Boot::install`'s source closure, which is the last
+    /// moment before the only thing draining the link is the image stream.
+    Ready,
+    /// device -> host: the boot record's `persist::BankState` for the bank
+    /// this image is running from and for the other one, carried raw for the
+    /// same reason `State::revert_reason` is.
+    Banks { active: u8, inactive: u8 },
 }
 
 /// Serialize and COBS-frame `msg` into `buf`, returning the used prefix.
@@ -161,6 +176,12 @@ mod tests {
             confirmed: true,
         });
         roundtrip(Message::Reject);
+        roundtrip(Message::Ready);
+        roundtrip(Message::GetBanks);
+        roundtrip(Message::Banks {
+            active: 1,
+            inactive: 3,
+        });
     }
 
     #[test]

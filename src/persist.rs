@@ -231,7 +231,7 @@ impl BootState {
 /// `Invalid` is condemned: the bootloader never boots or re-trials it,
 /// though installing a new image over that bank resets it to `New`.
 #[repr(u8)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum BankState {
     #[default]
     None = 0,
@@ -499,6 +499,14 @@ unsafe impl<const OFFSET: usize> BootStorage for BkupRamStore<OFFSET> {
 #[cfg(feature = "target")]
 const STORE_WORDS: usize = size_of::<BootStore>() / 4;
 
+/// Bound on the `INTFLAG.SEEWRC` spin in [`SmartEepromStore`], in loop
+/// passes. Sized so that reaching it means the flag is not coming rather
+/// than that a write is merely slow: a sector reallocation is the longest
+/// thing a write can set off, and this is far more than one takes at any
+/// core clock the part runs.
+#[cfg(feature = "target")]
+const WRITE_COMPLETE_SPINS: u32 = 1_000_000;
+
 /// A word write to a locked SmartEEPROM is discarded silently; the
 /// read-back in [`SmartEepromStore`]'s
 /// [`write_raw`](BootStorage::write_raw) surfaces it as this.
@@ -579,6 +587,43 @@ impl<const OFFSET: usize> SmartEepromStore<OFFSET> {
         let regs = unsafe { &*Nvmctrl::ptr() };
         while regs.seestat().read().busy().bit_is_set() {}
     }
+
+    /// Arm the completion flag so the wait after a write sees that write.
+    ///
+    /// `INTFLAG.SEEWRC` is write-one-to-clear and latches until cleared, so
+    /// a flag left set by an earlier write would satisfy the next wait
+    /// immediately.
+    fn arm_write_complete() {
+        // SAFETY: a write-one-to-clear of one flag; the other flags take a
+        // zero, which leaves them alone.
+        let regs = unsafe { &*Nvmctrl::ptr() };
+        regs.intflag().write(|w| w.seewrc().set_bit());
+    }
+
+    /// Wait for a write to land.
+    ///
+    /// `SEESTAT.BUSY` alone is not enough. It reports the SmartEEPROM
+    /// controller busy, which can read clear in the window between an AHB
+    /// write being accepted and its journal entry being committed;
+    /// `INTFLAG.SEEWRC` (DS 25.6.8.6) is the flag that says the write itself
+    /// completed. Both are waited on: the completion first, then BUSY for
+    /// any sector reallocation the write set off.
+    ///
+    /// The completion spin is bounded, and deliberately. The flag's exact
+    /// behaviour has not been confirmed on silicon here, and a bootloader
+    /// that spun forever on a flag that never arrives would be worse than
+    /// one that fell through to the checks below. Exhausting the bound
+    /// leaves the outcome to the same `BUSY` wait and read-back this had
+    /// before, so the worst case is the old behaviour rather than a hang.
+    fn wait_write_complete() {
+        // SAFETY: read-only flag polls
+        let regs = unsafe { &*Nvmctrl::ptr() };
+        let mut spins = 0u32;
+        while regs.intflag().read().seewrc().bit_is_clear() && spins < WRITE_COMPLETE_SPINS {
+            spins += 1;
+        }
+        while regs.seestat().read().busy().bit_is_set() {}
+    }
 }
 
 // SAFETY: in unbuffered mode each 32-bit SEE write is journaled by the
@@ -609,8 +654,9 @@ unsafe impl<const OFFSET: usize> BootStorage for SmartEepromStore<OFFSET> {
             if unsafe { ptr.read_volatile() } == word {
                 continue;
             }
+            Self::arm_write_complete();
             unsafe { ptr.write_volatile(word) };
-            Self::wait_ready();
+            Self::wait_write_complete();
             if unsafe { ptr.read_volatile() } != word {
                 return Err(SeeWriteFailed);
             }

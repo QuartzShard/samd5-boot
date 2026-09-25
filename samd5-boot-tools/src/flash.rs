@@ -15,6 +15,15 @@
 //! application to do it, is what makes this work on a part whose
 //! application is missing or broken.
 //!
+//! `BKSWRST` also resets the part, which hands control to the BOOT at the
+//! head that is now active. That BOOT reads the boot record and acts on it,
+//! and one of the things it can decide is to swap straight back: a bank
+//! recorded `Invalid`, which is what any failed download leaves behind, is
+//! one `Boot::fall_back` reverts out of. So the swap arms the reset vector
+//! catch first and holds the core halted until both heads are written and
+//! read back, rather than racing the firmware for the bank. `release` is
+//! the single place that undoes it.
+//!
 //! Region locks are a separate protection from BOOTPROT:
 //! [`crate::provision`] locks the BOOT regions of *both* banks unless asked
 //! not to, and nothing here reads `RUNLOCK` or unlocks anything.
@@ -81,8 +90,21 @@ pub fn run(chip: &str, boot_bin: &Path, mode: Mode) -> Result<()> {
 
     verify(&mut device, &image, 0)?;
     verify(&mut device, &image, inactive)?;
+    release(&mut device)?;
     println!("both bank heads carry this BOOT");
 
+    Ok(())
+}
+
+/// Put the part back on its feet: reset catch off, core running.
+///
+/// The swap holds the core halted at the reset vector for the length of the
+/// dance, and every step in between inherits that. This is the one place
+/// that undoes it, so a `flash` always leaves the part running whichever
+/// branch it took.
+fn release(device: &mut Device) -> Result<()> {
+    let mut nvm = device.halted()?;
+    nvm.catch_reset(false)?;
     Ok(())
 }
 
@@ -120,6 +142,12 @@ fn swap(device: &mut Device) -> Result<()> {
             if before.a_first { "A" } else { "B" },
             if before.a_first { "B" } else { "A" }
         );
+        // The reset BKSWRST performs hands control to the BOOT at the head
+        // that is now active, which reads the boot record and can revert
+        // straight back out of a bank recorded `Invalid`. Catch the reset
+        // and hold the core there rather than racing it for the bank.
+        nvm.catch_reset(true)?;
+        nvm.stay_halted();
         // Errors show up as the re-halt below failing.
         nvm.command(Cmd::Bkswrst).ok();
     }
@@ -128,6 +156,10 @@ fn swap(device: &mut Device) -> Result<()> {
     loop {
         match device.halted() {
             Ok(mut nvm) => {
+                // Held halted at the reset vector until the dance is done,
+                // so nothing in between gets to swap the banks back.
+                nvm.stay_halted();
+                nvm.catch_reset(false)?;
                 let after = nvm.status()?;
                 println!("    back up, active bank {}", if after.a_first { "A" } else { "B" });
                 return Ok(());
@@ -143,6 +175,9 @@ fn swap(device: &mut Device) -> Result<()> {
 fn verify(device: &mut Device, image: &[u8], base: u64) -> Result<()> {
     let which = if base == 0 { "active" } else { "inactive" };
     let mut nvm = device.halted()?;
+    // Which head is which is only stable while nothing is running to swap
+    // them; `release` puts the part back on its feet once both are read.
+    nvm.stay_halted();
     let read = nvm.uncached(|nvm| {
         let mut buf = vec![0u8; image.len()];
         nvm.read_bytes(base, &mut buf)?;

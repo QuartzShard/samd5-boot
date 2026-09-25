@@ -16,11 +16,12 @@ verification by DSU CRC32, and rollback on failure driven by the watchdog.
 
 ## Status
 
-The install, verify, trial, confirm, reject, attempts-exhausted rollback
-and app-requested update paths are exercised on real silicon by
-[`examples/update-rig`](examples/update-rig), which is both the worked
-integration and the test suite: eight checks, each asserted against a
-device that really rebooted into the image under test. Resuming an
+The install, verify, trial, confirm, reject, attempts-exhausted rollback,
+app-requested update and abandoned-download paths are exercised on real
+silicon by [`examples/update-rig`](examples/update-rig), which is both the
+worked integration and the test suite: eleven checks, each asserted against
+a device that really rebooted into the image under test. The suite runs
+against either boot-record backing, backup RAM or SmartEEPROM. Resuming an
 interrupted install, rolling back from an interrupted revert, and coming
 up with nothing bootable have no test yet.
 
@@ -28,10 +29,18 @@ The rig runs over RTT by default, so reproducing it needs nothing but a
 debug probe, and over RS485 on request, which is the configuration that
 proves an update works with no debugger in the loop.
 
-The ABI is not frozen. P-256 image signing is reserved in the manifest and
-not implemented, and so is anti-rollback: the manifest's `version` field
-and the stored `Rollback` watermark are written but never compared. A
-manifest length field is still to be added before 1.0.
+The stored formats are frozen as of 1.0: the boot record, the application
+manifest and the boot-info block have fixed layouts, their spare space is
+defined as leave-as-found, and their offsets are pinned by tests. A
+bootloader and an application built against different versions agree on
+what the bytes mean. That is a promise about the bytes on the part and not
+about the Rust API, which is still moving.
+
+Two things are reserved rather than implemented. P-256 image signing has
+its fields in the manifest (`sig`, `pubkey_id`, `sig_scheme`) and is
+unsigned until it lands. Anti-rollback has the manifest's `version` field
+and the stored `Rollback` watermark, which are carried but never compared.
+Both were placed so that adopting them needs no format change.
 
 Provisioning a fresh part is `samd5-boot-tools provision`, and placing BOOT
 at both bank heads on a protected part is `samd5-boot-tools flash`; both are
@@ -41,7 +50,7 @@ proven on silicon.
 
 ```toml
 [dependencies]
-samd5-boot = { version = "0.1", features = ["samd51j20a"] }
+samd5-boot = { version = "1.1", features = ["samd51j20a"] }
 ```
 
 Selecting a part is how firmware asks for the driver; a part feature brings
@@ -65,13 +74,31 @@ waits for an image on whatever transport you plug in:
 ```rust
 let boot = Boot::new(nvm, dsu, wdt, config)?;
 let boot = boot.boot_or_enter_download(&mut store);   // returns only to enter download
-let Aborted { error, boot } = boot.install(&mut store, record, image_bytes);
+let Aborted { error, boot } = boot.install(&mut store, record, |_condemned| {
+    rx.set_ready();       // or nothing: `|_| image_bytes` is the plain form
+    image_bytes
+});
 ```
 
-`install` takes an `Iterator<Item = u8>`, so an image is pulled through one
-flash page buffer at a time and never has to fit in RAM. On success it does
-not return: the image is verified, the trial is recorded, and the bank swap
-reboots the part.
+The source is an `Iterator<Item = u8>`, so an image is pulled through one
+flash page buffer at a time and never has to fit in RAM. On success `install`
+does not return: the image is verified, the trial is recorded, and the bank
+swap reboots the part.
+
+It is a closure rather than the iterator itself because there is one moment
+worth naming. `install` first writes the boot record to condemn the bank it
+is about to overwrite, since until the new image verifies that bank holds
+neither the old one nor a whole new one. The closure runs after that write
+and before the first byte is read, which is where a receiver is declared
+ready or a host told to start sending. Earlier is too early, because the
+bank is still recorded bootable; after the call is far too late, because a
+successful install never returns. The `Condemned` it is handed is the proof
+of that write, and nothing can reach an erase without one.
+
+This matters most on a `SmartEepromStore`, where writing the record is a
+flash program. A bootloader that draws bytes off the wire in its own
+foreground is not draining the link for its duration, so a host that started
+sending any earlier is sending at a receiver that cannot keep up.
 
 The application reserves a manifest slot with `install_manifest!`, and a
 post-link step fills in the length and CRCs with
@@ -111,7 +138,7 @@ and `stamp` directly and keep them in its existing build, which is what the
 [repository](https://github.com/QuartzShard/samd5-boot) and is not published:
 it is the worked integration, not a product. Clone it to run the suite.
 
-It is also the test suite: eight checks driven from a host and reported as
+It is also the test suite: eleven checks driven from a host and reported as
 PASS/FAIL, over RTT (which needs only a debug probe) or RS485. On an
 ATSAMD51J20A with a probe attached:
 
@@ -136,12 +163,12 @@ same definitions the firmware compiles against.
 ```
 cargo xtask info      --chip <CHIP>   what a part is configured as
 cargo xtask provision --chip <CHIP>   write and verify the fuses
-cargo xtask build     [--rs485]       build and stamp the demo images
+cargo xtask build     [--rs485] [--see]  build and stamp the demo images
 cargo xtask flash     --chip <CHIP>   place BOOT at both bank heads
 cargo xtask stamp <in> <out> --version N
-cargo xtask link      --chip <CHIP> <ping|state|update|...>
-cargo xtask request-update --chip <CHIP>   make BOOT wait, from the debugger
-cargo xtask test      --chip <CHIP> [--port <dev>]
+cargo xtask link      --chip <CHIP> <ping|state|banks|update|...>
+cargo xtask request-update --chip <CHIP> [--see]  make BOOT wait, from the debugger
+cargo xtask test      --chip <CHIP> [--port <dev>] [--see]
 ```
 
 ## Hazards worth knowing
@@ -155,6 +182,11 @@ cargo xtask test      --chip <CHIP> [--port <dev>]
   issuing `BKSWRST`, writing the head that is now inactive, and swapping
   back, rather than writing one head and trusting the image being replaced
   to swap into it. Two swaps leave the same bank active as before.
+- **`BKSWRST` resets the part**, so the bootloader at the newly active head
+  starts running immediately and may decide to swap back: a bank recorded
+  `Invalid`, which any failed download leaves behind, is one `fall_back`
+  reverts out of. A debugger driving the two-swap dance has to catch that
+  reset and hold the core, not race it. `samd5-boot-tools flash` does.
 - **A chip erase does not clear BOOTPROT**, the region locks, or the rest of
   the user page.
 

@@ -16,11 +16,15 @@
 //!    when a store write failed. There is no listening window, so an
 //!    update is always something the application asked for before it
 //!    reset.
-//! 4. BOOT then waits for a [`Message::BeginUpdate`] with no deadline and
-//!    pulls exactly `len` raw bytes off the wire into [`Boot::install`],
-//!    which verifies the image, records the trial, and swaps banks. The
-//!    swap reboots, so a successful install never returns; a failed one
-//!    comes back and is reported as [`Message::UpdateResult`].
+//! 4. BOOT then waits for a [`Message::BeginUpdate`] with no deadline. A
+//!    `len` past [`Boot::app_region_len`] is refused there and then, before
+//!    anything is erased. Otherwise [`Boot::install`] runs, and BOOT
+//!    answers [`Message::Ready`] from its source closure: that is once the
+//!    boot record condemns the target bank and before the first byte is
+//!    read, which is the last moment anything but `ImageStream` is draining
+//!    this link. `install` then verifies the image, records the trial, and
+//!    swaps banks. The swap reboots, so a successful install never returns;
+//!    a failed one comes back as [`Message::UpdateResult`].
 //! 5. A failed install holds the link open until the host speaks again,
 //!    then the loop returns to step 3: a rejected update must not cost the
 //!    device its working app.
@@ -38,6 +42,11 @@
 //! the host mid-image, while the writer stops reading for an NVMCTRL program
 //! at every page and for an erase at every 16-page block. The transport has
 //! to absorb that; see `RX_RING` in `demo-serial`.
+//!
+//! The `Ready` handshake covers the one stall the buffer should not have to:
+//! condemning the bank is a boot-record write, and under `--features
+//! see-store` that is a flash program. Nothing here reads the wire during
+//! it, so the host is told to hold the body until it is done.
 #![no_std]
 #![no_main]
 
@@ -50,8 +59,13 @@ use samd5_boot::{
     Aborted, Boot, BootConfig, FlashError, InstallError, Unverified,
     boot_info::{self, BootInfo},
     consts, install_boot_info,
-    persist::{BkupRamStore, BootStorage},
+    persist::BootStorage,
 };
+
+#[cfg(not(feature = "see-store"))]
+use samd5_boot::persist::BkupRamStore;
+#[cfg(feature = "see-store")]
+use samd5_boot::persist::SmartEepromStore;
 
 // The transport is whichever crate the `rtt` / `rs485` feature selected.
 // Both expose the same `Link` surface; only the constructor differs, which
@@ -61,6 +75,19 @@ use demo_serial as link;
 #[cfg(feature = "rtt")]
 use demo_rtt as link;
 use link::Link;
+
+/// Where the boot record lives. The application must be built to match, or
+/// the two do not see each other's writes.
+///
+/// Backup RAM survives the BKSWRST reset, so trial bookkeeping works, while
+/// a power cut reads back as a fresh store rather than a stale trial. It
+/// also keeps the rig off the SmartEEPROM fuses, which is why it is the
+/// default; `--features see-store` runs the same rig against SmartEEPROM,
+/// which needs a part provisioned with a non-zero SBLK.
+#[cfg(not(feature = "see-store"))]
+type Store = BkupRamStore<{ link::STORE_OFFSET }>;
+#[cfg(feature = "see-store")]
+type Store = SmartEepromStore<0>;
 
 /// Silence that abandons a raw image body mid-stream.
 const BYTE_TIMEOUT_MS: u32 = 1000;
@@ -119,11 +146,10 @@ fn main() -> ! {
 
     let mut clock = Millis::new(core.SYST);
     let mut decoder = Decoder::new();
-    // Backup RAM survives the BKSWRST reset, so trial bookkeeping works,
-    // while a power cut reads back as a fresh store rather than a stale
-    // trial. It also keeps the rig off the SmartEEPROM fuses.
-    // SAFETY: nothing else in this rig uses the base of backup RAM.
-    let mut store = unsafe { BkupRamStore::<{ link::STORE_OFFSET }>::new() };
+    let Some(mut store) = open_store() else {
+        rprintln!("boot: SmartEEPROM unusable, run `cargo xtask provision --sblk 1`");
+        park()
+    };
 
     let mut boot = boot;
     loop {
@@ -196,21 +222,39 @@ fn handover(serial: &mut Link, clock: &mut Millis) {
 /// Returns only on failure, having reported it to the host.
 fn install(
     boot: Boot<Unverified>,
-    store: &mut BkupRamStore<{ link::STORE_OFFSET }>,
+    store: &mut Store,
     serial: &mut Link,
     clock: &mut Millis,
     len: u32,
 ) -> Boot<Unverified> {
+    // Refused here rather than by the writer, which erases as it goes: an
+    // image that was never going to fit should not cost the inactive bank
+    // the one it already holds.
+    let region = boot.app_region_len();
+    if len as usize > region {
+        rprintln!("boot: {} bytes will not fit the {} byte app region", len, region);
+        send(serial, &Message::UpdateResult(Status::TooLarge));
+        return boot;
+    }
+
     rprintln!("boot: installing {} bytes", len);
     let record = store.read().unwrap_or_default();
     serial.take_rx_error();
 
-    let source = ImageStream {
-        serial: &mut *serial,
-        clock,
-        left: len,
-    };
-    let Aborted { error, boot } = boot.install(store, record, source);
+    // Past the closure below the only thing draining this link is
+    // `ImageStream`, in BOOT's own foreground. So the host is told to start
+    // there and not before: `Boot::condemn` writes the boot record first,
+    // and on a SmartEEPROM store that write is a flash program that BOOT
+    // spends not reading the wire.
+    let link = &mut *serial;
+    let Aborted { error, boot } = boot.install(store, record, move |_condemned| {
+        send(link, &Message::Ready);
+        ImageStream {
+            serial: link,
+            clock,
+            left: len,
+        }
+    });
 
     if serial.take_rx_error() {
         rprintln!("boot: receive error during the image body (overrun?)");
@@ -255,6 +299,17 @@ impl Iterator for ImageStream<'_> {
             }
         }
     }
+}
+
+#[cfg(not(feature = "see-store"))]
+fn open_store() -> Option<Store> {
+    // SAFETY: nothing else in this rig uses the base of backup RAM.
+    Some(unsafe { BkupRamStore::new() })
+}
+
+#[cfg(feature = "see-store")]
+fn open_store() -> Option<Store> {
+    SmartEepromStore::new().ok()
 }
 
 fn send(serial: &mut Link, msg: &Message) {

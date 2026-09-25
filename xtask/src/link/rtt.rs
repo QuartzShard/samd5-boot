@@ -263,9 +263,12 @@ impl Transport for RttLink {
             let channel = rtt
                 .down_channel(DOWN)
                 .ok_or_else(|| anyhow::anyhow!("down channel {DOWN} is missing"))?;
-            // A short write means the target has not drained the ring yet.
-            // Nothing is lost by waiting, so this transport needs no flow
-            // control of its own.
+            // A short write means the target has not drained the ring yet,
+            // and retrying costs nothing. What retrying cannot ride out is
+            // the ring filling to the last byte, which probe-rs reports as
+            // a corrupt control block rather than a short count; keeping
+            // the body out of that window is `Link::begin_update`'s job,
+            // not this loop's.
             let n = channel.write(&mut core, rest).context("writing to RTT")?;
             rest = &rest[n..];
             if n == 0 && Instant::now() >= deadline {

@@ -6,7 +6,7 @@
 //! on three specific pins in exchange for proving an update with no debugger
 //! in the loop.
 //!
-//! # Why the bootloader stops needing flow control
+//! # What the buffer covers, and what it does not
 //!
 //! The hard part of streaming an image into `Boot::install` is that the
 //! writer stops reading for tens of milliseconds at every page program, and
@@ -14,9 +14,16 @@
 //! why `demo-serial` carries an 8 KiB interrupt-fed ring.
 //!
 //! Here the buffer *is* the transport. The host writes into a ring in RAM
-//! and the target drains it whenever it gets around to it; if the ring fills,
-//! the host's write reports a short count and it tries again. Nothing is
-//! lost because nothing was ever in flight.
+//! and the target drains it whenever it gets around to it, so an ordinary
+//! page-program stall costs a short write and a retry rather than data.
+//!
+//! What it does not cover is a stall long enough to fill [`RX_RING`]
+//! outright. This receiver is BOOT's own foreground loop, so nothing drains
+//! while BOOT writes the boot record, and under `--features see-store` that
+//! write is a flash program. An exactly full ring is also where probe-rs
+//! 0.30 stops reporting short counts and starts refusing the channel as a
+//! corrupt control block. The `Ready` handshake in `proto` keeps the host
+//! out of that window; it is sent from `Boot::install`'s source closure.
 //!
 //! # Channels
 //!

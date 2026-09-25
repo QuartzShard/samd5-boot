@@ -14,6 +14,9 @@ rtt = ["dep:demo-rtt"]
 rs485 = ["dep:demo-serial"]
 # Skip the confirm call, so BOOT eventually rolls this image back.
 noconfirm = []
+# Keep the boot record in SmartEEPROM rather than backup RAM. BOOT must be
+# built with it too, and the part provisioned with a non-zero SBLK.
+see-store = []
 
 [dependencies]
 samd5-boot = { path = "../../..", features = ["samd51j20a"] }

@@ -43,7 +43,11 @@
 //! recorded. In download mode the binary drives its own transport and calls
 //! [`Boot::install`], which streams an image into the inactive slot, records
 //! a trial, and swaps. When to give up (a silence timeout, a retry budget)
-//! is the binary's policy, since it owns the transport. [`Boot::verify`]
+//! is the binary's policy, since it owns the transport. [`Boot::install`]
+//! takes its image source as a closure rather than an iterator, because it
+//! condemns the bank it is about to overwrite before it reads a byte: the
+//! closure runs between that record write and the first erase, which is
+//! where a receiver is declared ready. [`Boot::verify`]
 //! gates the jump into the active image and [`Boot::revert`] condemns it and
 //! swaps back.
 //!

@@ -64,6 +64,29 @@ pub enum Transport {
     Rs485,
 }
 
+/// Which [`BootStorage`](samd5_boot::persist::BootStorage) backend the
+/// firmware keeps the boot record in. Backup RAM needs nothing of the part;
+/// SmartEEPROM needs a non-zero SBLK, which `xtask provision --sblk` writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Store {
+    BkupRam,
+    SmartEeprom,
+}
+
+impl Store {
+    pub fn for_see(see: bool) -> Self {
+        if see { Self::SmartEeprom } else { Self::BkupRam }
+    }
+
+    /// The feature that selects it in both firmware crates.
+    fn features(self) -> &'static [&'static str] {
+        match self {
+            Self::BkupRam => &[],
+            Self::SmartEeprom => &["see-store"],
+        }
+    }
+}
+
 impl Transport {
     pub fn for_rs485(rs485: bool) -> Self {
         if rs485 { Self::Rs485 } else { Self::Rtt }
@@ -85,22 +108,27 @@ impl Transport {
     }
 }
 
-/// Build both application images and BOOT for `transport`, stamp the two
-/// applications, and return where they landed.
+/// Build both application images and BOOT for `transport` and `store`,
+/// stamp the two applications, and return where they landed.
+///
+/// All three are built the same way on purpose: BOOT and the application
+/// have to agree on both the link and the record's backing.
 ///
 /// Also leaves the unstamped `app-raw.bin` and `app-nc-raw.bin` in the demo
 /// directory.
-pub fn build_demo(transport: Transport) -> Result<Artifacts> {
+pub fn build_demo(transport: Transport, store: Store) -> Result<Artifacts> {
     let demo = demo_dir();
     let out = Artifacts::in_demo_dir();
+    let common = store.features();
 
     println!("[1/3] app (confirming build)");
-    cargo(&demo.join("app"), &transport.args(&[]))?;
+    cargo(&demo.join("app"), &transport.args(common))?;
     let app_raw = objcopy(&demo.join("app"), "app", &demo.join("app-raw.bin"))?;
     report(stamp(&app_raw, &out.app, APP_VERSION)?, &out.app);
 
     println!("[2/3] app (no-confirm build)");
-    cargo(&demo.join("app"), &transport.args(&["noconfirm"]))?;
+    let noconfirm = [common, &["noconfirm"]].concat();
+    cargo(&demo.join("app"), &transport.args(&noconfirm))?;
     let nc_raw = objcopy(&demo.join("app"), "app", &demo.join("app-nc-raw.bin"))?;
     report(
         stamp(&nc_raw, &out.app_noconfirm, APP_NOCONFIRM_VERSION)?,
@@ -108,7 +136,7 @@ pub fn build_demo(transport: Transport) -> Result<Artifacts> {
     );
 
     println!("[3/3] boot");
-    cargo(&demo.join("boot"), &transport.args(&[]))?;
+    cargo(&demo.join("boot"), &transport.args(common))?;
     objcopy(&demo.join("boot"), "demo-boot", &out.boot)?;
 
     Ok(out)
